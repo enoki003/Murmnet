@@ -1,0 +1,22 @@
+{
+  "personal_1gpu": {
+    "model_size": "small",
+    "num_experts": 8,
+    "top_k": 1,
+    "seq_len": 512,
+    "micro_batch": 1,
+    "accum_steps": 16,
+    "router_dropout": 0.1,
+    "load_balance_coef": 0.01
+  },
+  "two_gpu_research": {
+    "model_size": "base",
+    "num_experts": 16,
+    "top_k": 2,
+    "seq_len": 1024,
+    "micro_batch": 2,
+    "accum_steps": 16,
+    "router_dropout": 0.1,
+    "load_balance_coef": 0.01
+  }
+}

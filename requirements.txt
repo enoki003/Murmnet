@@ -1,0 +1,11 @@
+torch>=2.2.0
+transformers>=4.41.0
+datasets>=2.19.0
+tqdm>=4.66.0
+numpy>=1.26.0
+scikit-learn>=1.3.0
+accelerate>=0.33.0
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+rouge-score>=0.1.2
+sentence-transformers>=3.0.0

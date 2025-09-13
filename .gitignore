@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# Cache & logs
+*.log
+.cache/
+outputs/
+checkpoints/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+dist/
+
+# Data (optional)
+/data/
