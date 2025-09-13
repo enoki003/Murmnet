@@ -19,23 +19,34 @@ class MoEConfig:
     vocab_size: int = 32000
     max_position: int = 2048
     # Router/MoE extras
+    # Legacy single capacity (kept for backward compatibility)
     capacity_factor: float = 1.25
+    # Switch-style options
+    capacity_factor_train: float = 1.25
+    capacity_factor_eval: float = 1.0
+    switch_mode: bool = False  # if True, force top-1, no second-choice; overflow tokens are dropped
+    drop_tokens: bool = True
+    use_second_choice: bool = True  # ignored when switch_mode=True
+    router_noise_std: float = 0.0  # Gaussian noise on router logits during training (Switch: noisy top-1)
     temperature: float = 1.0
     fallback_self_ffn: bool = True
 
 
 class TopKRouter(nn.Module):
-    def __init__(self, hidden_dim: int, num_experts: int, top_k: int, dropout: float = 0.0, temperature: float = 1.0) -> None:
+    def __init__(self, hidden_dim: int, num_experts: int, top_k: int, dropout: float = 0.0, temperature: float = 1.0, noise_std: float = 0.0) -> None:
         nn.Module.__init__(self)  # type: ignore[misc]
         self.num_experts = num_experts
         self.top_k = top_k
         self.linear = nn.Linear(hidden_dim, num_experts)
         self.dropout = nn.Dropout(dropout)
         self.tau = temperature
+        self.noise_std = noise_std
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # x: (B, T, H)
         logits = self.linear(self.dropout(x))  # (B, T, E)
+        if self.training and self.noise_std > 0.0:
+            logits = logits + torch.randn_like(logits) * self.noise_std
         g_soft = F.softmax(logits / self.tau, dim=-1)
         topk_idx = torch.topk(g_soft, k=self.top_k, dim=-1)[1]
         hard = torch.zeros_like(g_soft).scatter_(-1, topk_idx, 1.0)
@@ -57,26 +68,53 @@ class ExpertFFN(nn.Module):
 
 
 class MoELayer(nn.Module):
-    def __init__(self, hidden_dim: int, ffn_dim: int, num_experts: int, top_k: int, router_dropout: float = 0.0, capacity_factor: float = 1.25, temperature: float = 1.0, fallback_self_ffn: bool = True) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        ffn_dim: int,
+        num_experts: int,
+        top_k: int,
+        router_dropout: float = 0.0,
+        capacity_factor: float = 1.25,
+        temperature: float = 1.0,
+        fallback_self_ffn: bool = True,
+        capacity_factor_train: float = 1.25,
+        capacity_factor_eval: float = 1.0,
+        switch_mode: bool = False,
+        drop_tokens: bool = True,
+        use_second_choice: bool = True,
+        router_noise_std: float = 0.0,
+    ) -> None:
         nn.Module.__init__(self)  # type: ignore[misc]
-        self.router = TopKRouter(hidden_dim, num_experts, top_k, router_dropout, temperature)
+        self.router = TopKRouter(hidden_dim, num_experts, top_k, router_dropout, temperature, noise_std=router_noise_std)
         self.experts = nn.ModuleList([ExpertFFN(hidden_dim, ffn_dim) for _ in range(num_experts)])
         self.num_experts = num_experts
         self.top_k = top_k
-        self.capacity_factor = capacity_factor
-        self.fallback_self_ffn = fallback_self_ffn
+        self.capacity_factor = capacity_factor  # legacy single factor (unused if train/eval factors provided)
+        self.capacity_factor_train = capacity_factor_train
+        self.capacity_factor_eval = capacity_factor_eval
+        self.switch_mode = switch_mode
+        self.drop_tokens = drop_tokens
+        self.use_second_choice = use_second_choice
+        # In Switch mode, disable dense fallback by default
+        self.fallback_self_ffn = (fallback_self_ffn and (not switch_mode))
         self.self_ffn: Optional[ExpertFFN] = ExpertFFN(hidden_dim, ffn_dim) if fallback_self_ffn else None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         B, T, H = x.shape
+        # In Switch mode, enforce top-1 regardless of config.top_k
+        if self.switch_mode and self.router.top_k != 1:
+            self.router.top_k = 1
         gates, idx, logits = self.router(x)  # (B, T, E), (B, T, K), (B, T, E)
         N = B * T
         gates_f = gates.view(N, self.num_experts)
-        idx_f = idx.view(N, self.top_k)
+        k_actual = idx.size(-1)
+        idx_f = idx.view(N, k_actual)
         x_f = x.view(N, H)
         device = x.device
-        # Capacity per expert by primary assignment
-        cap = max(1, int((N / self.num_experts) * self.capacity_factor))
+        # Capacity per expert (Switch uses separate train/eval factors)
+        cf = self.capacity_factor_train if self.training else self.capacity_factor_eval
+        cap = max(1, int((N / self.num_experts) * cf))
         primary = idx_f[:, 0]
         keep_primary = torch.zeros(N, dtype=torch.bool, device=device)
         assign = torch.full((N,), -1, dtype=torch.long, device=device)
@@ -85,15 +123,16 @@ class MoELayer(nn.Module):
             mask_e = (primary == e).nonzero(as_tuple=False).squeeze(-1)
             if mask_e.numel() == 0:
                 continue
-            n = int(min(cap - int(used[e].item()), mask_e.numel()))
+            free = max(0, cap - int(used[e].item()))
+            n = int(min(free, mask_e.numel()))
             if n > 0:
                 sel = mask_e[:n]
                 keep_primary[sel] = True
                 assign[sel] = e
                 used[e] += n
-        # Backup to second expert
+        # Backup to second expert (disabled in Switch mode)
         overflow = ~keep_primary
-        if self.top_k > 1:
+        if (not self.switch_mode) and self.use_second_choice and (k_actual > 1):
             second = idx_f[:, 1]
             for e in range(self.num_experts):
                 if used[e] >= cap:
@@ -108,8 +147,8 @@ class MoELayer(nn.Module):
                     assign[sel] = e
                     used[e] += n
                     overflow[sel] = False
-        # Fallback to self FFN
-        use_fallback = overflow & (self.self_ffn is not None)
+        # Fallback to self FFN (disabled in Switch mode by default)
+        use_fallback = overflow & (self.self_ffn is not None) if (not self.switch_mode) else torch.zeros_like(overflow)
 
         # Compute expert outputs (simple full compute)
         expert_outputs = [self.experts[e](x_f) for e in range(self.num_experts)]
@@ -118,17 +157,15 @@ class MoELayer(nn.Module):
         valid = assign >= 0
         one_hot[valid, assign[valid]] = 1.0
         y = (expert_stack * one_hot.unsqueeze(-1)).sum(dim=1)
-        if use_fallback.any():
+        if (not self.switch_mode) and use_fallback.any():
             assert self.self_ffn is not None
             y_fb = self.self_ffn(x_f[use_fallback])
             y[use_fallback] = y_fb
         y = y.view(B, T, H)
 
         util = one_hot.mean(dim=0)
-        with torch.no_grad():
-            f = torch.zeros(self.num_experts, device=device, dtype=expert_stack.dtype)
-            f.scatter_add_(0, primary, torch.ones_like(primary, dtype=expert_stack.dtype))
-            f = f / N
+        # Switch aux uses f (actual fraction assigned) and P (mean soft prob)
+        f = util.detach()
         P = gates_f.mean(dim=0)
         stats: Dict[str, torch.Tensor] = {"f": f, "P": P, "logits": logits.view(N, self.num_experts), "gates_soft": gates_f, "topk_idx": idx_f}
         return y, util, stats
@@ -174,11 +211,17 @@ class TinyMoETransformer(nn.Module):
                 H,
                 cfg.ffn_dim,
                 cfg.num_experts,
-                cfg.top_k,
+                1 if cfg.switch_mode else cfg.top_k,
                 cfg.router_dropout,
                 capacity_factor=cfg.capacity_factor,
                 temperature=cfg.temperature,
-                fallback_self_ffn=cfg.fallback_self_ffn,
+                fallback_self_ffn=(cfg.fallback_self_ffn and (not cfg.switch_mode)),
+                capacity_factor_train=cfg.capacity_factor_train,
+                capacity_factor_eval=cfg.capacity_factor_eval,
+                switch_mode=cfg.switch_mode,
+                drop_tokens=cfg.drop_tokens,
+                use_second_choice=(cfg.use_second_choice and (not cfg.switch_mode)),
+                router_noise_std=cfg.router_noise_std,
             ) if (i % 2 == 1) else None
             blocks.append(TransformerBlock(H, heads, cfg.ffn_dim, moe))
         self.blocks = nn.ModuleList(blocks)
