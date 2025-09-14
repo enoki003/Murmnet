@@ -18,13 +18,13 @@ python -m src.tools.smoke_test
 
 成功すれば、MoE層＋Boids項を含む forward/backward が1バッチ通ります。
 
-## まず回す実行例（SQuADサブセット相当: dummy/small）
+## まず回す実行例（HFデータローダ: small/full）
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python -m src.train \
   --task squad \
-  --dataset_size dummy \
+  --dataset_size small \
   --model_size small \
   --num_experts 8 --top_k 1 \
   --seq_len 512 \
@@ -43,7 +43,29 @@ python -m src.train --task cnndm --dataset_size small --model_size small --seq_l
 
 # 短文分類（単純CE）
 python -m src.train --task sst2 --dataset_size small --model_size tiny --seq_len 256 --train_epochs 1 --boids_on true
+
+メモ:
+- 本リポはWindows対応を考慮し、DataLoaderのワーカ数は既定で0に設定しています（マルチプロセスのpickle問題回避）。
+- `--dataset_size` は `small`/`full`。ダミーデータは廃止しました。
+
+## バックエンド切替（学習: tiny / 推論デモ: hf_moe）
+
+- 既定の学習バックエンドは本リポの TinyMoE（`--backend tiny`）。
+- 外部HFモデル（例: gpt2）を使った簡易推論デモは `--backend hf_moe` で動きます（学習は終了し、サンプル出力のみ）。
+
+```powershell
+python -m src.train --backend hf_moe
 ```
+上記は1サンプルを生成して終了します。学習は `--backend tiny` を使用してください。
+
+## ローカルWebチャット（TinyMoE）
+
+簡易Web UIでTinyMoEと対話できます。
+
+```powershell
+python -m src.app.chat
+```
+ローカルURL: <http://127.0.0.1:7860>
 
 ## 設定プリセット（規模別の現実的ライン）
 
@@ -62,8 +84,8 @@ python -m src.train --task sst2 --dataset_size small --model_size tiny --seq_len
 
 - 安定: 出力自己一致率、埋め込み分散
 - MoE効率: expert利用エントロピー、偏り超過率
-- 品質: EM/F1（SQuAD）、ROUGE（CNN/DM）、Accuracy（SST-2）
-  - 本リリースでは分類Accuracyを即時提供、EM/ROUGEは後述の簡易評価器で参照可
+- 品質: EM/F1（SQuAD）、ROUGE-L F1（CNN/DM）、Accuracy（SST-2）
+  - devバッチ1個を貪欲デコードで簡易評価して平均を表示します（`src/train.py` 終了時にJSONで出力）。
 - 冗長: n-gram反復率（2–4gram）
 
 ## 注意
@@ -91,4 +113,17 @@ python -m src.train --task sst2 --dataset_size small --model_size tiny --seq_len
   - SQuAD（QA）、CNN/DailyMail（要約）、SST-2（感情分類）を `datasets` から取得可能。
   - それぞれのライセンスはHFページでの最新情報を確認してください（SQuADやCNN/DMはCC系、GLUEはタスク毎に条件が異なります）。
 
+### 調達スクリプト
+
+最低限のモデル・データセットのキャッシュ取得は以下で可能です。
+
+```powershell
+python -m src.tools.procure_assets
+```
+
 > 備考: 本リポの学習ループは“TinyMoE”バックエンドが既定です。外部MoE（Switch/Qwen2-MoE等）による学習は将来の拡張で提供予定です。
+
+## ライセンス・法的注意
+
+- 本リポジトリのコードライセンスは未確定です（プロジェクト所有者による選択を想定）。
+- `LEGAL.md` に第三者資産（Hugging Faceモデル/データセット等）に関する注意事項を記載しています。各資産のライセンス・利用条件を遵守してください。

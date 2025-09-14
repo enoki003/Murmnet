@@ -1,38 +1,25 @@
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
+import torch  # 型注釈内で "torch.Tensor" を使用するため参照を用意
 
-import torch
-from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-
-class DummyLMSet(Dataset[Dict[str, Tensor]]):
-    def __init__(self, size: int = 128, seq_len: int = 64, vocab: int = 32000, seed: int = 42):
-        g = torch.Generator().manual_seed(seed)
-        self.input_ids: Tensor = torch.randint(0, vocab, (size, seq_len), generator=g)
-        self.labels: Tensor = self.input_ids.clone()
-
-    def __len__(self) -> int:
-        return int(self.input_ids.size(0))
-
-    def __getitem__(self, idx: int) -> Dict[str, Tensor]:
-        return {"input_ids": self.input_ids[idx], "labels": self.labels[idx]}
+# 本ファイルは過去のダミーデータ実装を廃止し、Hugging Face datasets ローダーの薄いラッパーに置き換えました。
+# すべてのデータは `src/data/hf_loader.py` の `build_hf_dataloaders` に委譲されます。
 
 
-def build_dataloaders(task: str, dataset_size: str, seq_len: int, micro_batch: int, num_workers: int = 2) -> Tuple[DataLoader[Dict[str, Tensor]], DataLoader[Dict[str, Tensor]]]:
-    # Minimal: use dummy dataset; real datasets can be plugged with HuggingFace datasets later.
-    if dataset_size == "dummy":
-        train = DummyLMSet(size=128, seq_len=seq_len)
-        dev = DummyLMSet(size=64, seq_len=seq_len, seed=123)
-    else:
-        # Placeholder: same as dummy for now
-        train = DummyLMSet(size=1024 if dataset_size == "small" else 8192, seq_len=seq_len)
-        dev = DummyLMSet(size=256, seq_len=seq_len, seed=123)
+def build_dataloaders(
+    task: str,
+    dataset_size: str,
+    seq_len: int,
+    micro_batch: int,
+    num_workers: int = 0,
+) -> Tuple[DataLoader[Dict[str, "torch.Tensor"]], DataLoader[Dict[str, "torch.Tensor"]], PreTrainedTokenizerBase]:
+    from .hf_loader import build_hf_dataloaders
 
-    def collate(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        labels = torch.stack([b["labels"] for b in batch])
-        return {"input_ids": input_ids, "labels": labels}
+    # dataset_size は "small" または "full" を想定
+    if dataset_size not in {"small", "full"}:
+        # 後方互換のため 'dummy' やその他は 'small' にフォールバック
+        dataset_size = "small"
 
-    train_loader: DataLoader[Dict[str, Tensor]] = DataLoader(train, batch_size=micro_batch, shuffle=True, num_workers=num_workers, collate_fn=collate)
-    dev_loader: DataLoader[Dict[str, Tensor]] = DataLoader(dev, batch_size=micro_batch, shuffle=False, num_workers=num_workers, collate_fn=collate)
-    return train_loader, dev_loader
+    return build_hf_dataloaders(task, dataset_size, seq_len, micro_batch, num_workers=num_workers)

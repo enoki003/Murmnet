@@ -34,7 +34,7 @@ def build_hf_dataloaders(
     dataset_size: str,
     seq_len: int,
     micro_batch: int,
-    num_workers: int = 2,
+    num_workers: int = 0,
 ) -> Tuple[DataLoader[Dict[str, Tensor]], DataLoader[Dict[str, Tensor]], PreTrainedTokenizerBase]:
     # Tokenizer (English defaults)
     tok_name = "gpt2"

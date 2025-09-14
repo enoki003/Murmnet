@@ -9,3 +9,4 @@ sentencepiece>=0.1.99
 protobuf>=4.25.0
 rouge-score>=0.1.2
 sentence-transformers>=3.0.0
+gradio>=4.44.0

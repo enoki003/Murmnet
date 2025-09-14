@@ -4,7 +4,7 @@ from typing import Optional, List, Dict, Tuple, cast
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim.adamw import AdamW
 from torch.nn.utils import clip_grad_norm_ as clip_grad_norm
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -13,9 +13,7 @@ from contextlib import nullcontext
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from .models.moe import MoEConfig, TinyMoETransformer
-from .models.hf_moe_stub import HFMoELoader
 from .regularizers.boids import BoidsConfig, BoidsRegularizer
-from .data.loader import build_dataloaders
 from .eval.metrics import self_consistency_rate, expert_entropy
 from .eval.moe_utils import overuse_rate
 from .eval.text_utils import ngram_repeat_rate
@@ -74,7 +72,7 @@ def make_model(cfg: TrainConfig, vocab_size: Optional[int] = None) -> TinyMoETra
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser()
     p.add_argument("--task", type=str, default="squad", choices=["squad", "cnndm", "sst2"])  # 形式のみ
-    p.add_argument("--dataset_size", type=str, default="dummy", choices=["dummy", "small", "full"])
+    p.add_argument("--dataset_size", type=str, default="small", choices=["small", "full"])
     p.add_argument("--model_size", type=str, default="small", choices=list(MODEL_SIZES.keys()))
     p.add_argument("--num_experts", type=int, default=16)
     p.add_argument("--top_k", type=int, default=2)
@@ -102,28 +100,46 @@ def parse_args() -> TrainConfig:
 def main():
     cfg = parse_args()
     device = torch.device(cfg.device)
-    # Data & tokenizer
-    tok: Optional[PreTrainedTokenizerBase] = None
-    if cfg.dataset_size == "dummy":
-        train_loader, dev_loader = build_dataloaders(cfg.task, cfg.dataset_size, cfg.seq_len, cfg.micro_batch)
-    else:
-        from .data import hf_loader as _hf_loader
-        train_loader, dev_loader, tok = _hf_loader.build_hf_dataloaders(
-            cfg.task, cfg.dataset_size, cfg.seq_len, cfg.micro_batch
-        )
+    # Data & tokenizer (HF only)
+    tok: PreTrainedTokenizerBase
+    from .data import hf_loader as _hf_loader
+    train_loader, dev_loader, tok = _hf_loader.build_hf_dataloaders(
+        cfg.task, cfg.dataset_size, cfg.seq_len, cfg.micro_batch
+    )
     # Type hints for analyzers
     train_loader: DataLoader[Dict[str, torch.Tensor]] = train_loader
     dev_loader: DataLoader[Dict[str, torch.Tensor]] = dev_loader
 
     if cfg.backend == "tiny":
-        vocab_sz: Optional[int] = len(tok.get_vocab()) if tok is not None else None
+        vocab_sz: Optional[int] = len(tok.get_vocab()) if hasattr(tok, "get_vocab") else None
         model = make_model(cfg, vocab_size=vocab_sz).to(device)
     else:
-        # Placeholder: Switch/Qwen2-MoE等は後日対応
-        _ = HFMoELoader()
-        raise SystemExit("hf_moe backend is not implemented yet. Use --backend tiny for now.")
+        # HF backend: 現状は学習未対応。CausalLMで簡易サンプル生成のみ実施して終了。
+        from transformers.models.auto.tokenization_auto import AutoTokenizer
+        from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
-    opt = optim.AdamW(model.parameters(), lr=cfg.lr)
+        model_name = "gpt2"
+        tkn = AutoTokenizer.from_pretrained(model_name)  # type: ignore
+        if tkn.pad_token is None:  # type: ignore
+            tkn.pad_token = tkn.eos_token or tkn.unk_token  # type: ignore
+        mdl = AutoModelForCausalLM.from_pretrained(model_name).to(device)  # type: ignore
+        mdl.eval()  # type: ignore
+        prompt = "Hello from MurmNet!"  # 簡易デモ
+        with torch.no_grad():
+            enc = tkn(prompt, return_tensors="pt", add_special_tokens=False).to(device)  # type: ignore
+            input_ids = enc["input_ids"]  # type: ignore
+            for _ in range(32):
+                out = mdl(input_ids)  # type: ignore
+                next_logits = out.logits[:, -1, :]  # type: ignore
+                next_id = next_logits.softmax(-1).multinomial(1)  # type: ignore
+                input_ids = torch.cat([input_ids, next_id], dim=1)
+                if tkn.eos_token_id is not None and int(next_id.item()) == int(tkn.eos_token_id):  # type: ignore
+                    break
+            text = tkn.decode(input_ids[0].tolist(), skip_special_tokens=True)  # type: ignore
+        print("[hf_moe] sample:", text[len(prompt):])  # type: ignore
+        raise SystemExit("hf_moe backend is inference-only for now. Use --backend tiny to train.")
+
+    opt = AdamW(model.parameters(), lr=cfg.lr)
     ce = nn.CrossEntropyLoss(ignore_index=-100)
     # Boids (router level)
     boids_router = BoidsRouterLoss(
@@ -133,14 +149,15 @@ def main():
         k_nn=cfg.boids_k_nn,
         sep_tau=cfg.boids_sep_tau,
     ) if cfg.boids_on else None
-    boids = BoidsRegularizer(BoidsConfig(
+    boids_cfg: BoidsConfig = BoidsConfig(
         lambda_c=cfg.boids_lambda_c,
         lambda_s=cfg.boids_lambda_s,
         lambda_a=cfg.boids_lambda_a,
         k_nn=cfg.boids_k_nn,
         sep_tau=cfg.boids_sep_tau,
         warmup_frac=cfg.boids_warmup_frac,
-    )) if cfg.boids_on else None
+    )
+    boids = BoidsRegularizer(boids_cfg) if cfg.boids_on else None
 
     model.train()
     global_step = 0
@@ -210,22 +227,67 @@ def main():
     model.train()
     logits_runs: List[torch.Tensor] = []
     util_eval: Optional[torch.Tensor] = None
+    last_batch: Optional[Dict[str, torch.Tensor]] = None
     with torch.no_grad():
         for _ in range(cfg.eval_trials):
             for batch in dev_loader:
                 input_ids = batch["input_ids"].to(device)
                 logits, util_eval = model(input_ids)
                 logits_runs.append(logits.cpu())
+                last_batch = batch
                 break  # one batch per trial
     sc = self_consistency_rate(logits_runs)
     ent = expert_entropy(util_eval.detach().cpu()) if util_eval is not None else 0.0
-    # Compute n-gram repetition on greedy of last dev batch
+    # Compute n-gram repetition, and task metrics (EM/F1/ROUGE/Acc) on last dev batch
+    from .eval.metrics import squad_em_f1, rougeL_f1, sst2_label_from_text
     last_logits: torch.Tensor = logits_runs[-1]
-    pred_ids: List[int] = last_logits.argmax(dim=-1)[0].tolist()  # type: ignore[assignment]
-    rep2 = ngram_repeat_rate(pred_ids, 2)
-    rep3 = ngram_repeat_rate(pred_ids, 3)
+    rep2: float = 0.0
+    rep3: float = 0.0
+    task_metric: Dict[str, float] = {}
+    if last_batch is not None:
+        labels_dev = last_batch["labels"]  # (B,T)
+        greedy = last_logits.argmax(dim=-1)  # (B,T)
+        pad_pred_ids: List[int] = list(map(int, greedy[0].tolist()))  # type: ignore[assignment]
+        rep2 = ngram_repeat_rate(pad_pred_ids, 2)
+        rep3 = ngram_repeat_rate(pad_pred_ids, 3)
+        # compute per-sample metrics on answer spans (labels != -100)
+        em_list: List[float] = []
+        f1_list: List[float] = []
+        rl_list: List[float] = []
+        acc_list: List[float] = []
+        for i in range(int(labels_dev.size(0))):
+            mask = labels_dev[i] != -100
+            if not bool(mask.any()):
+                continue
+            tgt_ids: List[int] = list(map(int, labels_dev[i][mask].tolist()))  # type: ignore[arg-type]
+            prd_ids: List[int] = list(map(int, greedy[i][mask].tolist()))      # type: ignore[arg-type]
+            tgt_txt = tok.decode(tgt_ids, skip_special_tokens=True)  # type: ignore[reportUnknownMemberType]
+            prd_txt = tok.decode(prd_ids, skip_special_tokens=True)  # type: ignore[reportUnknownMemberType]
+            if cfg.task == "squad":
+                em, f1 = squad_em_f1(prd_txt, tgt_txt)
+                em_list.append(em)
+                f1_list.append(f1)
+            elif cfg.task == "cnndm":
+                rl = rougeL_f1(prd_txt, tgt_txt)
+                rl_list.append(rl)
+            elif cfg.task == "sst2":
+                gt = sst2_label_from_text(tgt_txt)
+                pd = sst2_label_from_text(prd_txt)
+                if gt is not None and pd is not None:
+                    acc_list.append(1.0 if gt == pd else 0.0)
+        if cfg.task == "squad":
+            task_metric = {
+                "squad_em": float(sum(em_list) / max(1, len(em_list))),
+                "squad_f1": float(sum(f1_list) / max(1, len(f1_list))),
+            }
+        elif cfg.task == "cnndm":
+            task_metric = {"rougeL_f1": float(sum(rl_list) / max(1, len(rl_list)))}
+        elif cfg.task == "sst2":
+            task_metric = {"acc": float(sum(acc_list) / max(1, len(acc_list)))}
     over = overuse_rate(util_eval.detach().cpu()) if util_eval is not None else 0.0
-    print({"self_consistency": sc, "expert_entropy": ent, "overuse_rate": over, "repeat_2gram": rep2, "repeat_3gram": rep3})
+    summary = {"self_consistency": sc, "expert_entropy": ent, "overuse_rate": over, "repeat_2gram": rep2, "repeat_3gram": rep3}
+    summary.update(task_metric)
+    print(summary)
 
 
 if __name__ == "__main__":
