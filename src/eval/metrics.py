@@ -1,8 +1,18 @@
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Mapping, Protocol
 
 import torch
 import re
 from rouge_score import rouge_scorer  # type: ignore[reportMissingImports]
+
+
+class _RougeScore(Protocol):
+    precision: float
+    recall: float
+    fmeasure: float
+
+
+class _RougeScorerLike(Protocol):
+    def score(self, target: str, prediction: str) -> Mapping[str, _RougeScore]: ...
 
 
 def self_consistency_rate(logits_list: List[torch.Tensor]) -> float:
@@ -61,7 +71,7 @@ def squad_em_f1(pred: str, gold: str) -> Tuple[float, float]:
         f1 = 2 * precision * recall / (precision + recall)
     return float(em), float(f1)
 
-_rouge_scorer: Any = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)  # type: ignore[reportUnknownMemberType]
+_rouge_scorer: _RougeScorerLike = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)  # type: ignore[reportUnknownMemberType]
 
 def rougeL_f1(pred: str, ref: str) -> float:
     score = _rouge_scorer.score(ref, pred)["rougeL"]

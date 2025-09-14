@@ -1,6 +1,8 @@
+from __future__ import annotations
 import argparse
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, cast
+from typing import Optional, List, Dict, Tuple, cast, Protocol, Mapping
+import importlib
 
 import torch
 import torch.nn as nn
@@ -8,7 +10,8 @@ from torch.optim.adamw import AdamW
 from torch.nn.utils import clip_grad_norm_ as clip_grad_norm
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from torch.amp import autocast as amp_autocast, GradScaler as AmpGradScaler  # type: ignore
+from torch.amp.autocast_mode import autocast as amp_autocast
+from torch.amp.grad_scaler import GradScaler as AmpGradScaler
 from contextlib import nullcontext
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -115,28 +118,44 @@ def main():
         model = make_model(cfg, vocab_size=vocab_sz).to(device)
     else:
         # HF backend: 現状は学習未対応。CausalLMで簡易サンプル生成のみ実施して終了。
-        from transformers.models.auto.tokenization_auto import AutoTokenizer
-        from transformers.models.auto.modeling_auto import AutoModelForCausalLM
+        class _HFTokenizer(Protocol):
+            def __call__(self, text: str, *, return_tensors: str, add_special_tokens: bool = ...) -> Mapping[str, torch.Tensor]: ...
+            def decode(self, token_ids: List[int] | torch.Tensor, *, skip_special_tokens: bool = ...) -> str: ...
+            eos_token_id: Optional[int]
+
+        class _CausalLMOut(Protocol):
+            logits: torch.Tensor
+
+        class _HFCausalLM(Protocol):
+            def __call__(self, input_ids: torch.Tensor) -> _CausalLMOut: ...
+            def to(self, device: torch.device | str) -> "_HFCausalLM": ...
+            def eval(self) -> "_HFCausalLM": ...
 
         model_name = "gpt2"
-        tkn = AutoTokenizer.from_pretrained(model_name)  # type: ignore
-        if tkn.pad_token is None:  # type: ignore
-            tkn.pad_token = tkn.eos_token or tkn.unk_token  # type: ignore
-        mdl = AutoModelForCausalLM.from_pretrained(model_name).to(device)  # type: ignore
-        mdl.eval()  # type: ignore
+        tok_mod = importlib.import_module("transformers.models.auto.tokenization_auto")
+        AutoTokenizer = getattr(tok_mod, "AutoTokenizer")
+        tkn = cast(_HFTokenizer, AutoTokenizer.from_pretrained(model_name))
+        pad_tok = getattr(tkn, "eos_token", None) or getattr(tkn, "unk_token", None)
+        if getattr(tkn, "pad_token", None) is None and pad_tok is not None:
+            setattr(tkn, "pad_token", pad_tok)
+        mdl_mod = importlib.import_module("transformers.models.auto.modeling_auto")
+        AutoModelForCausalLM = getattr(mdl_mod, "AutoModelForCausalLM")
+        mdl = cast(_HFCausalLM, AutoModelForCausalLM.from_pretrained(model_name)).to(device)
+        mdl = mdl.eval()
         prompt = "Hello from MurmNet!"  # 簡易デモ
         with torch.no_grad():
-            enc = tkn(prompt, return_tensors="pt", add_special_tokens=False).to(device)  # type: ignore
-            input_ids = enc["input_ids"]  # type: ignore
+            enc = tkn(prompt, return_tensors="pt", add_special_tokens=False)
+            input_ids = enc["input_ids"].to(device)
             for _ in range(32):
-                out = mdl(input_ids)  # type: ignore
-                next_logits = out.logits[:, -1, :]  # type: ignore
-                next_id = next_logits.softmax(-1).multinomial(1)  # type: ignore
+                out: _CausalLMOut = mdl(input_ids)
+                next_logits = out.logits[:, -1, :]
+                next_id = next_logits.softmax(-1).multinomial(1)
                 input_ids = torch.cat([input_ids, next_id], dim=1)
-                if tkn.eos_token_id is not None and int(next_id.item()) == int(tkn.eos_token_id):  # type: ignore
+                if getattr(tkn, "eos_token_id", None) is not None and int(next_id.item()) == int(getattr(tkn, "eos_token_id")):
                     break
-            text = tkn.decode(input_ids[0].tolist(), skip_special_tokens=True)  # type: ignore
-        print("[hf_moe] sample:", text[len(prompt):])  # type: ignore
+            ids_list: List[int] = [int(x) for x in input_ids[0]]
+            text = tkn.decode(ids_list, skip_special_tokens=True)
+        print("[hf_moe] sample:", text[len(prompt):])
         raise SystemExit("hf_moe backend is inference-only for now. Use --backend tiny to train.")
 
     opt = AdamW(model.parameters(), lr=cfg.lr)
@@ -212,7 +231,11 @@ def main():
                     loss_boids_router = br["boids"]
                 loss: torch.Tensor = loss_ce + loss_moe + loss_boids + loss_boids_router
 
-            scaler.scale(loss / cfg.accum_steps).backward()  # type: ignore[misc]
+            # mypy/pyright: scale() return type lacks backward signature -> cast via a tiny protocol
+            class _BackpropLike(Protocol):
+                def backward(self) -> None: ...
+            scaled = cast(_BackpropLike, scaler.scale(loss / cfg.accum_steps))
+            scaled.backward()
             if (it + 1) % cfg.accum_steps == 0:
                 scaler.unscale_(opt)
                 clip_grad_norm(model.parameters(), 1.0)
@@ -220,7 +243,10 @@ def main():
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
             global_step += 1
-            pbar.set_postfix({"loss": float(loss.item()), "boids": float(loss_boids.item()) if boids else 0.0})  # type: ignore[arg-type]
+            postfix: Dict[str, object] = {"loss": float(loss.item()), "boids": float(loss_boids.item()) if boids else 0.0}
+            class _TqdmLike(Protocol):
+                def set_postfix(self, ordered_dict: Mapping[str, object] | None = ..., refresh: Optional[bool] = True, **kwargs: object) -> None: ...
+            cast(_TqdmLike, pbar).set_postfix(postfix)
 
     # Quick eval: self-consistency via multiple stochastic passes (dropout active)
     # Enable dropout for stochasticity during self-consistency measurement
@@ -247,7 +273,7 @@ def main():
     if last_batch is not None:
         labels_dev = last_batch["labels"]  # (B,T)
         greedy = last_logits.argmax(dim=-1)  # (B,T)
-        pad_pred_ids: List[int] = list(map(int, greedy[0].tolist()))  # type: ignore[assignment]
+        pad_pred_ids: List[int] = [int(x) for x in greedy[0]]
         rep2 = ngram_repeat_rate(pad_pred_ids, 2)
         rep3 = ngram_repeat_rate(pad_pred_ids, 3)
         # compute per-sample metrics on answer spans (labels != -100)
@@ -259,10 +285,14 @@ def main():
             mask = labels_dev[i] != -100
             if not bool(mask.any()):
                 continue
-            tgt_ids: List[int] = list(map(int, labels_dev[i][mask].tolist()))  # type: ignore[arg-type]
-            prd_ids: List[int] = list(map(int, greedy[i][mask].tolist()))      # type: ignore[arg-type]
-            tgt_txt = tok.decode(tgt_ids, skip_special_tokens=True)  # type: ignore[reportUnknownMemberType]
-            prd_txt = tok.decode(prd_ids, skip_special_tokens=True)  # type: ignore[reportUnknownMemberType]
+            tgt_ids: List[int] = [int(x) for x in labels_dev[i][mask]]
+            prd_ids: List[int] = [int(x) for x in greedy[i][mask]]
+            # narrow tokenizer type for analyzers
+            class _TokDecodeLike(Protocol):
+                def decode(self, token_ids: List[int] | torch.Tensor, *, skip_special_tokens: bool = ...) -> str: ...
+            _tok = cast(_TokDecodeLike, tok)
+            tgt_txt = _tok.decode(tgt_ids, skip_special_tokens=True)
+            prd_txt = _tok.decode(prd_ids, skip_special_tokens=True)
             if cfg.task == "squad":
                 em, f1 = squad_em_f1(prd_txt, tgt_txt)
                 em_list.append(em)

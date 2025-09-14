@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -32,9 +32,24 @@ class MoEConfig:
     fallback_self_ffn: bool = True
 
 
-class TopKRouter(nn.Module):
-    def __init__(self, hidden_dim: int, num_experts: int, top_k: int, dropout: float = 0.0, temperature: float = 1.0, noise_std: float = 0.0) -> None:
-        nn.Module.__init__(self)  # type: ignore[misc]
+if TYPE_CHECKING:
+    class _ModuleBase(nn.Module):
+        def __init__(self) -> None: ...
+else:  # runtime
+    _ModuleBase = nn.Module
+
+
+class TopKRouter(_ModuleBase):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_experts: int,
+        top_k: int,
+        dropout: float = 0.0,
+        temperature: float = 1.0,
+        noise_std: float = 0.0,
+    ) -> None:
+        super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.linear = nn.Linear(hidden_dim, num_experts)
@@ -42,23 +57,27 @@ class TopKRouter(nn.Module):
         self.tau = temperature
         self.noise_std = noise_std
 
+    def set_top_k(self, k: int) -> None:
+        self.top_k = k
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # x: (B, T, H)
         logits = self.linear(self.dropout(x))  # (B, T, E)
         if self.training and self.noise_std > 0.0:
             logits = logits + torch.randn_like(logits) * self.noise_std
         g_soft = F.softmax(logits / self.tau, dim=-1)
-        topk_idx = torch.topk(g_soft, k=self.top_k, dim=-1)[1]
+        topk = torch.topk(g_soft, k=self.top_k, dim=-1)
+        topk_idx = topk.indices
         hard = torch.zeros_like(g_soft).scatter_(-1, topk_idx, 1.0)
         mask = hard.detach() - g_soft.detach() + g_soft
-        g_top = g_soft * (mask > 0).float()
+        g_top = g_soft * (mask > 0).to(g_soft.dtype)
         g_top = g_top / (g_top.sum(dim=-1, keepdim=True) + 1e-9)
         return g_top, topk_idx, logits
 
 
-class ExpertFFN(nn.Module):
+class ExpertFFN(_ModuleBase):
     def __init__(self, hidden_dim: int, ffn_dim: int) -> None:
-        nn.Module.__init__(self)  # type: ignore[misc]
+        super().__init__()
         self.w1 = nn.Linear(hidden_dim, ffn_dim)
         self.w2 = nn.Linear(ffn_dim, hidden_dim)
         self.act = nn.GELU()
@@ -67,7 +86,7 @@ class ExpertFFN(nn.Module):
         return self.w2(self.act(self.w1(x)))
 
 
-class MoELayer(nn.Module):
+class MoELayer(_ModuleBase):
     def __init__(
         self,
         hidden_dim: int,
@@ -85,8 +104,15 @@ class MoELayer(nn.Module):
         use_second_choice: bool = True,
         router_noise_std: float = 0.0,
     ) -> None:
-        nn.Module.__init__(self)  # type: ignore[misc]
-        self.router = TopKRouter(hidden_dim, num_experts, top_k, router_dropout, temperature, noise_std=router_noise_std)
+        super().__init__()
+        self.router = TopKRouter(
+            hidden_dim,
+            num_experts,
+            top_k,
+            router_dropout,
+            temperature,
+            noise_std=router_noise_std,
+        )
         self.experts = nn.ModuleList([ExpertFFN(hidden_dim, ffn_dim) for _ in range(num_experts)])
         self.num_experts = num_experts
         self.top_k = top_k
@@ -98,13 +124,13 @@ class MoELayer(nn.Module):
         self.use_second_choice = use_second_choice
         # In Switch mode, disable dense fallback by default
         self.fallback_self_ffn = (fallback_self_ffn and (not switch_mode))
-        self.self_ffn: Optional[ExpertFFN] = ExpertFFN(hidden_dim, ffn_dim) if fallback_self_ffn else None
+        self.self_ffn = ExpertFFN(hidden_dim, ffn_dim) if fallback_self_ffn else None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         B, T, H = x.shape
         # In Switch mode, enforce top-1 regardless of config.top_k
         if self.switch_mode and self.router.top_k != 1:
-            self.router.top_k = 1
+            self.router.set_top_k(1)
         gates, idx, logits = self.router(x)  # (B, T, E), (B, T, K), (B, T, E)
         N = B * T
         gates_f = gates.view(N, self.num_experts)
@@ -167,17 +193,28 @@ class MoELayer(nn.Module):
         # Switch aux uses f (actual fraction assigned) and P (mean soft prob)
         f = util.detach()
         P = gates_f.mean(dim=0)
-        stats: Dict[str, torch.Tensor] = {"f": f, "P": P, "logits": logits.view(N, self.num_experts), "gates_soft": gates_f, "topk_idx": idx_f}
+        stats: Dict[str, torch.Tensor] = {
+            "f": f,
+            "P": P,
+            "logits": logits.view(N, self.num_experts),
+            "gates_soft": gates_f,
+            "topk_idx": idx_f,
+        }
         return y, util, stats
 
 
-class TransformerBlock(nn.Module):
+class TransformerBlock(_ModuleBase):
     def __init__(self, hidden_dim: int, num_heads: int, ffn_dim: int, moe: Optional[MoELayer] = None) -> None:
-        nn.Module.__init__(self)  # type: ignore[misc]
+        super().__init__()
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
-        self.mlp: Optional[nn.Sequential] = nn.Sequential(nn.Linear(hidden_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_dim)) if moe is None else None
+        self.mlp: Optional[nn.Sequential]
+        self.mlp = (
+            nn.Sequential(nn.Linear(hidden_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_dim))
+            if moe is None
+            else None
+        )
         self.moe = moe
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
@@ -196,9 +233,9 @@ class TransformerBlock(nn.Module):
         return x, util, stats
 
 
-class TinyMoETransformer(nn.Module):
+class TinyMoETransformer(_ModuleBase):
     def __init__(self, cfg: MoEConfig) -> None:
-        nn.Module.__init__(self)  # type: ignore[misc]
+        super().__init__()
         self.cfg = cfg
         H = cfg.hidden_dim
         self.emb = nn.Embedding(cfg.vocab_size, H)
@@ -207,22 +244,26 @@ class TinyMoETransformer(nn.Module):
         heads = 12 if H >= 768 else 8
         for i in range(cfg.num_layers):
             # Insert MoE every other block for simplicity
-            moe = MoELayer(
-                H,
-                cfg.ffn_dim,
-                cfg.num_experts,
-                1 if cfg.switch_mode else cfg.top_k,
-                cfg.router_dropout,
-                capacity_factor=cfg.capacity_factor,
-                temperature=cfg.temperature,
-                fallback_self_ffn=(cfg.fallback_self_ffn and (not cfg.switch_mode)),
-                capacity_factor_train=cfg.capacity_factor_train,
-                capacity_factor_eval=cfg.capacity_factor_eval,
-                switch_mode=cfg.switch_mode,
-                drop_tokens=cfg.drop_tokens,
-                use_second_choice=(cfg.use_second_choice and (not cfg.switch_mode)),
-                router_noise_std=cfg.router_noise_std,
-            ) if (i % 2 == 1) else None
+            moe = (
+                MoELayer(
+                    H,
+                    cfg.ffn_dim,
+                    cfg.num_experts,
+                    1 if cfg.switch_mode else cfg.top_k,
+                    cfg.router_dropout,
+                    capacity_factor=cfg.capacity_factor,
+                    temperature=cfg.temperature,
+                    fallback_self_ffn=(cfg.fallback_self_ffn and (not cfg.switch_mode)),
+                    capacity_factor_train=cfg.capacity_factor_train,
+                    capacity_factor_eval=cfg.capacity_factor_eval,
+                    switch_mode=cfg.switch_mode,
+                    drop_tokens=cfg.drop_tokens,
+                    use_second_choice=(cfg.use_second_choice and (not cfg.switch_mode)),
+                    router_noise_std=cfg.router_noise_std,
+                )
+                if (i % 2 == 1)
+                else None
+            )
             blocks.append(TransformerBlock(H, heads, cfg.ffn_dim, moe))
         self.blocks = nn.ModuleList(blocks)
         self.ln = nn.LayerNorm(H)

@@ -1,11 +1,20 @@
-from typing import Dict, List, Tuple, Optional, Mapping, TypeAlias, cast
+from typing import Dict, List, Tuple, Optional, Mapping, Sequence, TypeAlias, Protocol, runtime_checkable, cast
 
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
-from datasets import load_dataset, Dataset as HFDataset, DatasetDict  # type: ignore[import-not-found]
-from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from ..tools.hf_compat import (
+    HFDatasetLike,
+    load_dataset_compat,
+    auto_tokenizer_from_pretrained,
+)
+
+# Minimal protocol the mapped HF dataset objects satisfy after .map/select
+@runtime_checkable
+class _SupportsHF(Protocol):
+    def __len__(self) -> int: ...
+    def __getitem__(self, idx: int) -> Mapping[str, object]: ...
 
 
 def _get_eos_id(tok: PreTrainedTokenizerBase) -> int:
@@ -38,81 +47,85 @@ def build_hf_dataloaders(
 ) -> Tuple[DataLoader[Dict[str, Tensor]], DataLoader[Dict[str, Tensor]], PreTrainedTokenizerBase]:
     # Tokenizer (English defaults)
     tok_name = "gpt2"
-    tok = cast(PreTrainedTokenizerBase, AutoTokenizer.from_pretrained(tok_name))  # type: ignore[reportUnknownMemberType]
+    tok = auto_tokenizer_from_pretrained(tok_name)
     eos_id: int = _get_eos_id(tok)
 
     if task == "squad":
-        ds = cast(DatasetDict, load_dataset("squad"))  # type: ignore[reportUnknownMemberType]
+        ds = load_dataset_compat("squad")
         def encode(ex: Mapping[str, object]) -> Dict[str, List[int]]:
-            q: str = str(ex["question"])  # type: ignore[index]
-            c: str = str(ex["context"])  # type: ignore[index]
-            answers = ex.get("answers", {}) if isinstance(ex.get("answers", {}), dict) else {}  # type: ignore[arg-type]
-            ans_list: List[str] = cast(List[str], answers.get("text", [""])) if isinstance(answers, dict) else [""]  # type: ignore[call-arg]
+            q: str = str(ex["question"])  # hf schema
+            c: str = str(ex["context"])   # hf schema
+            answers_val = ex.get("answers")
+            ans_list: List[str] = [""]
+            if isinstance(answers_val, Mapping):
+                answers_map = cast(Mapping[str, object], answers_val)
+                text_val = answers_map.get("text")
+                if isinstance(text_val, list):
+                    seq = cast(Sequence[object], text_val)
+                    ans_list = [str(t) for t in seq]
             ans: str = str(ans_list[0]) if len(ans_list) > 0 else ""
             inp = f"Q: {q}\nC: {c}\nA: "
             out: str = ans
             enc_inp = tok(inp, truncation=True, max_length=seq_len, add_special_tokens=False)
             enc_out = tok(out, truncation=True, max_length=seq_len, add_special_tokens=False)
-            inp_ids: List[int] = cast(List[int], enc_inp["input_ids"])  # type: ignore[index]
-            out_ids: List[int] = cast(List[int], enc_out["input_ids"])   # type: ignore[index]
+            inp_ids = list(map(int, cast(List[int], enc_inp["input_ids"])))
+            out_ids = list(map(int, cast(List[int], enc_out["input_ids"])))
             input_ids: List[int] = inp_ids + out_ids + [eos_id]
             labels: List[int] = [-100] * len(inp_ids) + out_ids + [eos_id]
             input_ids = input_ids[:seq_len]
             labels = labels[:seq_len]
             return {"input_ids": input_ids, "labels": labels}
-        train: HFDataset = cast(HFDataset, ds["train"].map(encode, remove_columns=ds["train"].column_names))  # type: ignore[reportUnknownMemberType]
-        dev: HFDataset = cast(HFDataset, ds["validation"].map(encode, remove_columns=ds["validation"].column_names))  # type: ignore[reportUnknownMemberType]
+        train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
+        dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
     elif task == "cnndm":
-        ds = cast(DatasetDict, load_dataset("cnn_dailymail", "3.0.0"))  # type: ignore[reportUnknownMemberType]
+        ds = load_dataset_compat("cnn_dailymail", "3.0.0")
         def encode(ex: Mapping[str, object]) -> Dict[str, List[int]]:
-            art: str = str(ex["article"])  # type: ignore[index]
-            summ: str = str(ex["highlights"])  # type: ignore[index]
+            art: str = str(ex["article"])     # hf schema
+            summ: str = str(ex["highlights"])  # hf schema
             inp = f"Summarize:\n{art}\nSummary: "
             out: str = summ
             enc_inp = tok(inp, truncation=True, max_length=seq_len, add_special_tokens=False)
             enc_out = tok(out, truncation=True, max_length=seq_len, add_special_tokens=False)
-            inp_ids: List[int] = cast(List[int], enc_inp["input_ids"])  # type: ignore[index]
-            out_ids: List[int] = cast(List[int], enc_out["input_ids"])   # type: ignore[index]
+            inp_ids = list(map(int, cast(List[int], enc_inp["input_ids"])))
+            out_ids = list(map(int, cast(List[int], enc_out["input_ids"])))
             input_ids: List[int] = inp_ids + out_ids + [eos_id]
             labels: List[int] = [-100] * len(inp_ids) + out_ids + [eos_id]
             input_ids = input_ids[:seq_len]
             labels = labels[:seq_len]
             return {"input_ids": input_ids, "labels": labels}
-        train = cast(HFDataset, ds["train"].map(encode, remove_columns=ds["train"].column_names))  # type: ignore[reportUnknownMemberType]
-        dev = cast(HFDataset, ds["validation"].map(encode, remove_columns=ds["validation"].column_names))  # type: ignore[reportUnknownMemberType]
+        train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
+        dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
     elif task == "sst2":
-        ds = cast(DatasetDict, load_dataset("glue", "sst2"))  # type: ignore[reportUnknownMemberType]
+        ds = load_dataset_compat("glue", "sst2")
         def encode(ex: Mapping[str, object]) -> Dict[str, List[int]]:
-            text: str = str(ex["sentence"])  # type: ignore[index]
-            label: int = int(ex["label"])  # type: ignore[index]
+            text: str = str(ex["sentence"])  # hf schema
+            label_val = ex.get("label")
+            label: int = int(label_val) if isinstance(label_val, (int, str)) else 0
             tgt = "positive" if label == 1 else "negative"
             inp = f"Review: {text}\nSentiment: "
             enc_inp = tok(inp, truncation=True, max_length=seq_len, add_special_tokens=False)
             enc_out = tok(tgt, truncation=True, max_length=seq_len, add_special_tokens=False)
-            inp_ids: List[int] = cast(List[int], enc_inp["input_ids"])  # type: ignore[index]
-            out_ids: List[int] = cast(List[int], enc_out["input_ids"])   # type: ignore[index]
+            inp_ids = list(map(int, cast(List[int], enc_inp["input_ids"])))
+            out_ids = list(map(int, cast(List[int], enc_out["input_ids"])))
             input_ids: List[int] = inp_ids + out_ids + [eos_id]
             labels: List[int] = [-100] * len(inp_ids) + out_ids + [eos_id]
             input_ids = input_ids[:seq_len]
             labels = labels[:seq_len]
             return {"input_ids": input_ids, "labels": labels}
-        split_map = {"train": "train", "validation": "validation"}
-        train = cast(HFDataset, ds[split_map["train"]].map(encode, remove_columns=ds["train"].column_names))  # type: ignore[reportUnknownMemberType]
-        dev = cast(HFDataset, ds[split_map["validation"]].map(encode, remove_columns=ds["validation"].column_names))  # type: ignore[reportUnknownMemberType]
+        train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
+        dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
     else:
         # Fallback to dummy handled elsewhere
         raise ValueError("HF loader supports only 'squad', 'cnndm', and 'sst2' in this minimal setup")
 
     if dataset_size == "small":
-        # HF datasets stubs are incomplete; silence unknown member type on select
-        train = cast(HFDataset, train.select(range(min(5000, len(train)))))  # type: ignore[reportUnknownMemberType]
-        dev = cast(HFDataset, dev.select(range(min(1000, len(dev)))))        # type: ignore[reportUnknownMemberType]
+        train_like = cast(HFDatasetLike, train)
+        dev_like = cast(HFDatasetLike, dev)
+        train = cast(_SupportsHF, train_like.select(range(min(5000, len(train_like)))))
+        dev = cast(_SupportsHF, dev_like.select(range(min(1000, len(dev_like)))))
     elif dataset_size == "full":
-        pass
-    else:
-        # 'dummy' shouldn't route here
-        train = cast(HFDataset, train.select(range(min(512, len(train)))))   # type: ignore[reportUnknownMemberType]
-        dev = cast(HFDataset, dev.select(range(min(128, len(dev)))))         # type: ignore[reportUnknownMemberType]
+        # keep full size
+        ...
 
     pad_raw = getattr(tok, "pad_token_id", None)
     pad_id: int = int(pad_raw) if isinstance(pad_raw, int) else eos_id
@@ -120,7 +133,8 @@ def build_hf_dataloaders(
     def collate(batch: List[BatchDict]) -> BatchDict:
         input_ids = [batch[i]["input_ids"].to(dtype=torch.long) for i in range(len(batch))]
         labels = [batch[i]["labels"].to(dtype=torch.long) for i in range(len(batch))]
-        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=float(pad_id))
+        # padding_value should match dtype (long)
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_id)
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
         return {"input_ids": input_ids, "labels": labels}
 
@@ -128,14 +142,14 @@ def build_hf_dataloaders(
     from torch.utils.data import Dataset as TorchDataset  # local import to avoid name clash
 
     class HFToTorchDataset(TorchDataset[BatchDict]):
-        def __init__(self, ds: HFDataset):
+        def __init__(self, ds: _SupportsHF):
             self.ds = ds
         def __len__(self) -> int:
-            return int(len(self.ds))  # type: ignore[arg-type]
+            return int(len(self.ds))
         def __getitem__(self, idx: int) -> BatchDict:
-            item = cast(Mapping[str, object], self.ds[idx])  # type: ignore[index]
-            ids_list = cast(List[int], item["input_ids"])  # type: ignore[index]
-            lbl_list = cast(List[int], item["labels"])     # type: ignore[index]
+            item = self.ds[idx]
+            ids_list = list(map(int, cast(List[int], item["input_ids"])))
+            lbl_list = list(map(int, cast(List[int], item["labels"])))
             return {
                 "input_ids": torch.tensor(ids_list, dtype=torch.long),
                 "labels": torch.tensor(lbl_list, dtype=torch.long),

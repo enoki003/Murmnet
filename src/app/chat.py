@@ -1,10 +1,12 @@
 import os
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Mapping, Protocol, cast
+import importlib
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from ..tools.hf_compat import auto_tokenizer_from_pretrained
 
 from ..models.moe import MoEConfig, TinyMoETransformer
 
@@ -45,11 +47,15 @@ def build_model(cfg: ChatConfig, vocab_size: Optional[int] = None) -> TinyMoETra
     return TinyMoETransformer(mcfg)
 
 
-def generate(model: TinyMoETransformer, tok, prompt: str, cfg: ChatConfig) -> str:
+class _TokenizerDecodeLike(Protocol):
+    def decode(self, token_ids: "torch.Tensor | List[int] | int", *, skip_special_tokens: bool = ...) -> str: ...
+
+
+def generate(model: TinyMoETransformer, tok: PreTrainedTokenizerBase, prompt: str, cfg: ChatConfig) -> str:
     device = torch.device(cfg.device)
     model.eval()
     with torch.no_grad():
-        enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
+        enc = cast(Mapping[str, torch.Tensor], tok(prompt, return_tensors="pt", add_special_tokens=False))
         input_ids = enc["input_ids"].to(device)
         # truncate last seq_len tokens to fit context
         input_ids = input_ids[:, -cfg.seq_len:]
@@ -59,26 +65,37 @@ def generate(model: TinyMoETransformer, tok, prompt: str, cfg: ChatConfig) -> st
             probs = F.softmax(next_logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_id], dim=1)
-            if hasattr(tok, 'eos_token_id') and tok.eos_token_id is not None and next_id.item() == tok.eos_token_id:
+            eos_id = cast(Optional[int], getattr(tok, 'eos_token_id', None))
+            if eos_id is not None and next_id.item() == eos_id:
                 break
-        out = tok.decode(input_ids[0].tolist(), skip_special_tokens=True)
-        return out[len(prompt):]
+    row_t = input_ids[0].to(dtype=torch.long)
+    tok_dec = cast(_TokenizerDecodeLike, tok)
+    out: str = tok_dec.decode(row_t, skip_special_tokens=True)
+    return out[len(prompt):]
 
 
 # --------- Gradio UI ---------
-import gradio as gr
+## Gradio is imported dynamically to avoid type stub issues
+
+
+class _BlocksLike(Protocol):
+    def launch(self, *, server_name: str, server_port: int, share: bool) -> object: ...
 
 
 def build_demo():
     cfg = ChatConfig()
     tok_name = os.environ.get("MURMNET_TOKENIZER", "gpt2")
-    tok = AutoTokenizer.from_pretrained(tok_name)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token or tok.unk_token or tok.sep_token
-
-    model = build_model(cfg, vocab_size=len(tok))
+    tok: PreTrainedTokenizerBase = auto_tokenizer_from_pretrained(tok_name)
+    if getattr(tok, "pad_token", None) is None:
+        # Prefer EOS/UNK/SEP as padding if available
+        pad_tok = getattr(tok, "eos_token", None) or getattr(tok, "unk_token", None) or getattr(tok, "sep_token", None)
+        if pad_tok is not None:
+            setattr(tok, "pad_token", pad_tok)
+    vocab_size = int(getattr(tok, "vocab_size", 32000))
+    model = build_model(cfg, vocab_size=vocab_size)
     model.to(cfg.device)
 
+    gr = importlib.import_module("gradio")
     with gr.Blocks(title="MurmNet TinyMoE Chat") as demo:
         gr.Markdown("# MurmNet TinyMoE Chat\n小型MoEトランスフォーマでローカル会話")
         chatbot = gr.Chatbot(type="messages", height=400)
@@ -90,10 +107,16 @@ def build_demo():
 
         state = gr.State({"cfg": cfg, "tok": tok, "model": model})
 
-        def respond(user_message, chat_history, temperature, max_new, st):
-            st_cfg: ChatConfig = st["cfg"]
-            st_tok = st["tok"]
-            st_model: TinyMoETransformer = st["model"]
+    def respond(
+            user_message: str,
+            chat_history: Optional[List[Dict[str, str]]],
+            temperature: float,
+            max_new: int,
+            st: Dict[str, object],
+        ) -> Tuple[List[Dict[str, str]], Dict[str, object]]:
+            st_cfg = cast(ChatConfig, st["cfg"])  # runtime state typing
+            st_tok = cast(PreTrainedTokenizerBase, st["tok"])  # tokenizer
+            st_model = cast(TinyMoETransformer, st["model"])  # model
             # apply runtime knobs
             st_cfg.temperature = float(temperature)
             st_cfg.max_new_tokens = int(max_new)
@@ -116,10 +139,10 @@ def build_demo():
             ]
             return new_history, st
 
-        send.click(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
-        msg.submit(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
+    send.click(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
+    msg.submit(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
 
-    return demo
+    return cast(_BlocksLike, demo)
 
 
 def main():
