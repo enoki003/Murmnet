@@ -43,8 +43,10 @@ python -m src.train --task cnndm --dataset_size small --model_size small --seq_l
 
 # 短文分類（単純CE）
 python -m src.train --task sst2 --dataset_size small --model_size tiny --seq_len 256 --train_epochs 1 --boids_on true
+```
 
 メモ:
+
 - 本リポはWindows対応を考慮し、DataLoaderのワーカ数は既定で0に設定しています（マルチプロセスのpickle問題回避）。
 - `--dataset_size` は `small`/`full`。ダミーデータは廃止しました。
 
@@ -56,6 +58,7 @@ python -m src.train --task sst2 --dataset_size small --model_size tiny --seq_len
 ```powershell
 python -m src.train --backend hf_moe
 ```
+
 上記は1サンプルを生成して終了します。学習は `--backend tiny` を使用してください。
 
 ## ローカルWebチャット（TinyMoE）
@@ -65,7 +68,29 @@ python -m src.train --backend hf_moe
 ```powershell
 python -m src.app.chat
 ```
+
 ローカルURL: <http://127.0.0.1:7860>
+
+## 三条件比較（通常 / BOIDS / なし）
+
+研究用に、以下の3モードを同一条件で順に走らせ、最後にJSONで比較結果を出力するユーティリティを用意しています。
+
+- none: 補助損失なし（load balance=0, boids off）
+- normal: MoEロードバランスのみ（boids off）
+- boids: ロードバランス＋Boids正則化
+
+実行（PowerShell）:
+
+```powershell
+python -m src.tools.compare_modes --preset fast   # 速い比較（tiny/4 experts/seq 128, 1 epoch）
+python -m src.tools.compare_modes --preset full   # 推奨スケール（small/8 experts/seq 512, 1 epoch）
+```
+
+備考:
+
+- 各モードは `src.train` をサブプロセスで実行し、終了時に `src/train.py` が出力する最終JSONを収集します。
+- 3ジョブは順番に実行されます（同時ではありません）。別の学習タスクを同時に走らせている場合は、先にそちらを止めるか、比較ユーティリティの実行を後にしてください。
+- 乱数は `--seed 42` 固定で呼び出しています。個別に変更したい場合は `src/tools/compare_modes.py` の `base` 引数を調整してください。
 
 ## 設定プリセット（規模別の現実的ライン）
 
@@ -127,3 +152,4 @@ python -m src.tools.procure_assets
 
 - 本リポジトリのコードライセンスは未確定です（プロジェクト所有者による選択を想定）。
 - `LEGAL.md` に第三者資産（Hugging Faceモデル/データセット等）に関する注意事項を記載しています。各資産のライセンス・利用条件を遵守してください。
+

@@ -47,6 +47,7 @@ class TrainConfig:
     eval_trials: int
     device: str
     backend: str
+    seed: int
 
 
 MODEL_SIZES = {
@@ -96,6 +97,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--eval_trials", type=int, default=5)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--backend", type=str, default="tiny", choices=["tiny", "hf_moe"], help="Model backend: tiny (this repo) or hf_moe (stub)")
+    p.add_argument("--seed", type=int, default=42)
     a = p.parse_args()
     return TrainConfig(**vars(a))
 
@@ -103,6 +105,10 @@ def parse_args() -> TrainConfig:
 def main():
     cfg = parse_args()
     device = torch.device(cfg.device)
+    # Reproducibility (best-effort)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
     # Data & tokenizer (HF only)
     tok: PreTrainedTokenizerBase
     from .data import hf_loader as _hf_loader
