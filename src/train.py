@@ -80,6 +80,11 @@ def hf_load(model_id_or_dir: str, device: torch.device) -> Tuple[Any, HFSeq2SeqL
     mdl_mod = importlib.import_module("transformers.models.auto.modeling_auto")
     AutoModelForSeq2SeqLM = getattr(mdl_mod, "AutoModelForSeq2SeqLM")
     mdl_any: Any = AutoModelForSeq2SeqLM.from_pretrained(model_id_or_dir)
+    # Force router logits in config if supported
+    try:
+        setattr(mdl_any.config, "output_router_logits", True)
+    except Exception:
+        pass
     mdl = cast(HFSeq2SeqLike, mdl_any.to(device))
     return tok, mdl
 
@@ -112,12 +117,15 @@ def parse_args() -> TrainConfig:
     # Logging
     p.add_argument("--log_every", type=int, default=0, help="Print a one-line progress log every N steps (0=disabled)")
     # Boids regularization options
-    p.add_argument("--boids_on", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--boids_on", type=lambda x: x.lower() == "true", default=True, help="Boids regularization is mandatory; must be true")
     p.add_argument("--boids_weight", type=float, default=0.01)
     p.add_argument("--boids_align", type=float, default=1.0)
     p.add_argument("--boids_sep", type=float, default=1.0)
     p.add_argument("--boids_entropy", type=float, default=0.0)
     a = p.parse_args()
+    # Enforce Boids mandatory
+    if not bool(getattr(a, "boids_on", True)):
+        raise SystemExit("Boids regularization is mandatory for this project. Remove --boids_on false and use a Switch-Transformer model (e.g., google/switch-base-16).")
     return TrainConfig(**vars(a))
 
 
@@ -152,6 +160,43 @@ def main():
         model_id=cfg.model_id,
     )
 
+    # Router logits capture via forward hooks (fallback if outputs lack router info)
+    router_captures: List[torch.Tensor] = []
+    def _router_collect(x: Any, out_list: List[torch.Tensor]) -> None:
+        import torch as _torch
+        if isinstance(x, _torch.Tensor):
+            out_list.append(x)
+        elif isinstance(x, (list, tuple)):
+            for xi in cast(List[Any] | Tuple[Any, ...], x):
+                _router_collect(xi, out_list)
+        elif isinstance(x, dict):
+            for v in cast(Dict[Any, Any], x).values():
+                _router_collect(v, out_list)
+
+    def _make_router_hook():
+        def _hook(module: Any, inputs: Tuple[Any, ...], output: Any) -> None:
+            tmp: List[torch.Tensor] = []
+            _router_collect(output, tmp)
+            for t in tmp:
+                if t.dim() >= 3 and int(t.shape[-1]) >= 2 and torch.is_floating_point(t):
+                    router_captures.append(t.detach())
+        return _hook
+
+    hook_handles: List[Any] = []
+    try:
+        hook = _make_router_hook()
+        for name, m in cast(Any, model).named_modules():
+            lname = str(name).lower()
+            cls = m.__class__.__name__.lower() if hasattr(m, "__class__") else ""
+            if ("router" in lname) or ("router" in cls) or ("switch" in lname) or ("switch" in cls) or ("moe" in lname) or ("moe" in cls) or ("gate" in lname) or ("gate" in cls) or ("gating" in lname) or ("gating" in cls) or ("expert" in lname) or ("expert" in cls):
+                try:
+                    handle = m.register_forward_hook(hook)
+                    hook_handles.append(handle)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     # 評価専用モード: 先にチェックポイントをロード
     goto_eval = bool(cfg.eval_only)
 
@@ -175,37 +220,128 @@ def main():
                 # Mixed precision forward
                 amp_ctx = amp_autocast(device_type="cuda", enabled=torch.cuda.is_available()) if torch.cuda.is_available() else nullcontext()
                 with amp_ctx:
-                    # Ensure router logits are returned if available (HF Switch supports this flag)
-                    outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels, output_router_logits=cfg.boids_on)
+                    # Clear previous captures
+                    if router_captures:
+                        router_captures.clear()
+                    # Always request router logits (Boids mandatory)
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attn_mask,
+                        labels=labels,
+                        output_router_logits=True,
+                        return_dict=True,
+                    )
                     outputs_any: Any = outputs
                     loss: torch.Tensor = cast(torch.Tensor, outputs_any.loss)
-                    if cfg.boids_on:
-                        # Collect router probs per layer if present
-                        router_probs: list[torch.Tensor] = []
-                        rls = getattr(outputs_any, "router_logits", None)
-                        if rls is not None:
-                            # router_logits may be a list[Tensor] with shape (B, T, E)
-                            if isinstance(rls, (list, tuple)):
-                                for r in cast(list[Any], rls):
-                                    if isinstance(r, torch.Tensor):
-                                        router_probs.append(torch.softmax(r, dim=-1))
-                            elif isinstance(rls, torch.Tensor):
-                                router_probs.append(torch.softmax(rls, dim=-1))
-                        if router_probs:
-                            try:
-                                from .regularizers.boids import boids_regularize
-                                reg, _ = boids_regularize(
-                                    router_probs,
-                                    attn_mask,
-                                    weight=cfg.boids_weight,
-                                    w_align=cfg.boids_align,
-                                    w_separation=cfg.boids_sep,
-                                    w_entropy=cfg.boids_entropy,
-                                )
-                                loss = loss + reg
-                            except Exception as _:
-                                # If anything goes wrong, skip regularization silently
-                                pass
+
+                    # Collect router probs per layer robustly
+                    def _collect_tensors(x: Any, out_list: List[torch.Tensor]) -> None:
+                        import torch as _torch
+                        if isinstance(x, _torch.Tensor):
+                            out_list.append(x)
+                        elif isinstance(x, (list, tuple)):
+                            for xi in cast(List[Any] | Tuple[Any, ...], x):
+                                _collect_tensors(xi, out_list)
+                        elif isinstance(x, dict):
+                            for v in cast(Dict[Any, Any], x).values():
+                                _collect_tensors(v, out_list)
+
+                    router_probs: List[torch.Tensor] = []
+                    # Common attribute names across HF MoE variants
+                    cand_names = [
+                        "router_logits",
+                        "encoder_router_logits",
+                        "decoder_router_logits",
+                        "router_probabilities",
+                        "encoder_router_probabilities",
+                        "decoder_router_probabilities",
+                    ]
+                    collected_raw: List[torch.Tensor] = []
+                    for nm in cand_names:
+                        val = getattr(outputs_any, nm, None)
+                        if val is not None:
+                            _collect_tensors(val, collected_raw)
+                    # Fallback: some models may store in outputs.__dict__
+                    if not collected_raw and hasattr(outputs_any, "__dict__"):
+                        for k, v in getattr(outputs_any, "__dict__").items():
+                            if "router" in str(k):
+                                _collect_tensors(v, collected_raw)
+
+                    # Convert collected candidates to (B,T,E) probabilities
+                    B = int(attn_mask.size(0))
+                    T = int(attn_mask.size(1))
+                    def _standardize_to_bte(x: torch.Tensor) -> List[torch.Tensor]:
+                        out: List[torch.Tensor] = []
+                        if not torch.is_floating_point(x):
+                            return out
+                        dims = list(x.shape)
+                        if len(dims) < 3:
+                            return out
+                        # Find batch and seq axes matching attn_mask
+                        try:
+                            b_axes = [i for i, s in enumerate(dims) if int(s) == B]
+                            t_axes = [i for i, s in enumerate(dims) if int(s) == T]
+                        except Exception:
+                            return out
+                        if not b_axes or not t_axes:
+                            return out
+                        for bi in b_axes:
+                            for ti in t_axes:
+                                if bi == ti:
+                                    continue
+                                # Expert axis: choose any remaining axis with size >= 2
+                                e_axes = [i for i in range(len(dims)) if i not in (bi, ti) and int(dims[i]) >= 2]
+                                if not e_axes:
+                                    continue
+                                ei = e_axes[0]
+                                # Move to (B,T,E)
+                                perm = [bi, ti, ei] + [k for k in range(len(dims)) if k not in (bi, ti, ei)]
+                                xt = x.permute(*perm)
+                                # Keep only first three dims as (B,T,E) by flattening the rest into E
+                                if xt.dim() > 3:
+                                    new_b = int(xt.shape[0])
+                                    new_t = int(xt.shape[1])
+                                    new_e = int(torch.tensor(list(xt.shape[2:])).prod().item()) if xt.shape[2:] else int(xt.shape[2])
+                                    xt = xt.reshape(new_b, new_t, new_e)
+                                out.append(torch.softmax(xt, dim=-1))
+                                return out
+                        return out
+
+                    for t in collected_raw:
+                        for std in _standardize_to_bte(t):
+                            if int(std.size(0)) == B and int(std.size(1)) == T and int(std.size(2)) >= 2:
+                                router_probs.append(std)
+
+                    # Fallback to captured tensors from router modules
+                    if not router_probs and router_captures:
+                        for t in router_captures:
+                            for std in _standardize_to_bte(t):
+                                if int(std.size(0)) == B and int(std.size(1)) == T and int(std.size(2)) >= 2:
+                                    router_probs.append(std)
+
+                    # Filter to tensors with last-dim >= 2 (expert dimension)
+                    router_probs = [t for t in router_probs if t.dim() >= 3 and int(t.shape[-1]) >= 2]
+
+                    if not router_probs:
+                        try:
+                            keys = list(outputs_any.keys()) if hasattr(outputs_any, "keys") else []
+                            print(f"[boids] router tensors not found. outputs keys={keys}")
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "Router logits were not returned by the model. Boids is mandatory. Use a Switch-Transformer model (e.g., google/switch-base-16) and ensure output_router_logits is supported."
+                        )
+
+                    from .regularizers.boids import boids_regularize
+                    reg, boids_comps = boids_regularize(
+                        router_probs,
+                        attn_mask,
+                        weight=cfg.boids_weight,
+                        w_align=cfg.boids_align,
+                        w_separation=cfg.boids_sep,
+                        w_entropy=cfg.boids_entropy,
+                    )
+                    loss = loss + reg
 
                 # NaN/Inf guard on loss (pre-backward)
                 if cfg.nan_guard and not bool(torch.isfinite(loss)):
@@ -244,13 +380,29 @@ def main():
                     opt.zero_grad(set_to_none=True)
                 global_step += 1
                 postfix: Dict[str, object] = {"loss": float(loss.item())}
+                # 追加: Boidsロス内訳をコンパクトに表示（無害なオーバーヘッド）
+                try:
+                    align_v = float(boids_comps.get('align', torch.tensor(0.0)).item() if hasattr(boids_comps.get('align', 0.0), 'item') else boids_comps.get('align', 0.0))
+                    sep_v = float(boids_comps.get('separation', torch.tensor(0.0)).item() if hasattr(boids_comps.get('separation', 0.0), 'item') else boids_comps.get('separation', 0.0))
+                    ent_v = float(boids_comps.get('entropy', torch.tensor(0.0)).item() if hasattr(boids_comps.get('entropy', 0.0), 'item') else boids_comps.get('entropy', 0.0))
+                    reg_w = float(reg.item()) if hasattr(reg, 'item') else float(reg)
+                    postfix.update({"boids_align": round(align_v, 4), "boids_sep": round(sep_v, 4), "boids_ent": round(ent_v, 4), "boids_reg": round(reg_w, 4)})
+                except Exception:
+                    pass
                 class _TqdmLike(Protocol):
                     def set_postfix(self, ordered_dict: Mapping[str, object] | None = ..., refresh: Optional[bool] = True, **kwargs: object) -> None: ...
                 cast(_TqdmLike, pbar).set_postfix(postfix)
                 # Optional plain-text progress for non-interactive consoles
                 if cfg.log_every > 0 and (it % cfg.log_every == 0):
                     tot = len(train_loader)
-                    print(f"[train] epoch={epoch} step={it+1}/{tot} loss={float(loss.item()):.4f}")
+                    try:
+                        align_v = float(boids_comps.get('align', torch.tensor(0.0)).item() if hasattr(boids_comps.get('align', 0.0), 'item') else boids_comps.get('align', 0.0))
+                        sep_v = float(boids_comps.get('separation', torch.tensor(0.0)).item() if hasattr(boids_comps.get('separation', 0.0), 'item') else boids_comps.get('separation', 0.0))
+                        ent_v = float(boids_comps.get('entropy', torch.tensor(0.0)).item() if hasattr(boids_comps.get('entropy', 0.0), 'item') else boids_comps.get('entropy', 0.0))
+                        reg_w = float(reg.item()) if hasattr(reg, 'item') else float(reg)
+                        print(f"[train] epoch={epoch} step={it+1}/{tot} loss={float(loss.item()):.4f} boids_reg={reg_w:.4f} (align={align_v:.4f}, sep={sep_v:.4f}, ent={ent_v:.4f})")
+                    except Exception:
+                        print(f"[train] epoch={epoch} step={it+1}/{tot} loss={float(loss.item()):.4f}")
 
     # 学習後にチェックポイント保存（任意）
     if (not goto_eval) and cfg.save_dir:

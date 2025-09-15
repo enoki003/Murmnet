@@ -122,5 +122,4 @@ def compute_boids_router_loss(
     ent = ent_acc / max(1, n)
     total = w_align * align + w_separation * sep + w_entropy * ent
     return {"total": total, "align": align, "separation": sep, "entropy": ent}
-"""Removed: Boids router loss is not part of HF-only project."""
-raise ImportError("src.loss.boids_router_loss was removed in HF-only migration.")
+# End of module

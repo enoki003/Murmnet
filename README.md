@@ -1,6 +1,7 @@
-# MurmNet (HF Switch-Transformer 専用)
+# MurmNet（Plan‑B: HF Switch + Boids 正則化）
 
-このリポジトリは Hugging Face Transformers の Google Switch-Transformer（例: `google/switch-base-16`）のみを用いた学習・評価・簡易チャットを提供します。TinyMoE/Boids 関連は廃止しました。
+このリポジトリは Hugging Face Transformers の Google Switch‑Transformer（例: `google/switch-base-16`）を用いた学習・評価・チャットを提供します。
+Plan‑B として、Switch のルーティング確率に対して Boids 風正則化（整列・分散・任意のエントロピー）を必須で適用します。
 
 ## セットアップ
 
@@ -13,7 +14,7 @@ pip install -r requirements.txt
 
 ## 学習/評価
 
-学習は HF モデルの損失（labels を渡す）で行います。SQuAD / CNN/DailyMail / SST-2 に対応。
+学習は HF モデルの損失（labels を渡す）で行います。SQuAD / CNN/DailyMail / SST‑2 に対応。
 
 例（SQuAD、小規模で1epoch）:
 
@@ -30,6 +31,21 @@ python -m src.train --task squad --dataset_size small --seq_len 512 --train_epoc
 - チェックポイント保存: `--save_dir`; 評価のみ: `--eval_only --ckpt_path <dir>`
 - ログ頻度: `--log_every N`
 
+### Boids 正則化（必須）
+
+Switch の `router_logits` を用いて Boids 正則化を必ず適用します。
+
+```powershell
+python -m src.train --task squad --dataset_size small --seq_len 256 --train_epochs 1 --model_id google/switch-base-16 ^
+	--boids_on true --boids_weight 0.01 --boids_align 1.0 --boids_sep 1.0 --boids_entropy 0.0
+```
+
+- `--boids_on true`（デフォルト、必須）
+- `--boids_weight` は損失への寄与係数
+- `--boids_align`（隣接トークン整合）, `--boids_sep`（ロードバランス）, `--boids_entropy`（任意）
+
+注意: モデルが `router_logits` を返さない場合はエラーになります（Switch 系モデルを使用してください）。
+
 評価は `generate()` 後にタスク別指標（SQuAD: EM/F1, CNN/DM: ROUGE-L F1, SST-2: Accuracy）と繰り返し率（2/3-gram）を出力します。
 
 ## チャット UI
@@ -42,7 +58,9 @@ python -m src.app.chat
 
 起動後: <http://127.0.0.1:7860/>
 
-## 比較 UI（廃止）
+## MoE 実装について
 
-TinyMoE/BOIDS 比較は廃止しました。`src/app/compare.py` は非推奨メッセージのみを表示します。
+現在は HF Switch‑Transformer を前提にしています。専用の自前 MoE レイヤは同梱していませんが、
+将来的にカスタム MoE 実装を追加する場合は、ルータ確率を `(B,T,E)` で各層リストとして `outputs.router_logits` 互換で提供すれば、
+本リポジトリの Boids 正則化をそのまま適用できます。
 

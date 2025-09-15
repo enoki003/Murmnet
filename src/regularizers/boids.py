@@ -29,5 +29,4 @@ def boids_regularize(
     )
     total = comps["total"] * float(weight)
     return total, comps
-"""Removed: regularizer is not part of HF-only project."""
-raise ImportError("src.regularizers.boids was removed in HF-only migration.")
+# End of module
