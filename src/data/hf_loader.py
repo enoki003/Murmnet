@@ -75,10 +75,14 @@ def build_hf_dataloaders(
             enc_out = tok(out, truncation=True, max_length=seq_len, add_special_tokens=False)
             inp_ids = list(map(int, cast(List[int], enc_inp["input_ids"])))
             out_ids = list(map(int, cast(List[int], enc_out["input_ids"])))
-            input_ids: List[int] = inp_ids + out_ids + [eos_id]
-            labels: List[int] = [-100] * len(inp_ids) + out_ids + [eos_id]
-            input_ids = input_ids[:seq_len]
-            labels = labels[:seq_len]
+            # Ensure at least one target token remains after truncation
+            if len(out_ids) == 0:
+                out_ids = [eos_id]
+            out_keep = max(1, min(len(out_ids), seq_len - 1))  # reserve EOS
+            inp_keep = max(0, min(len(inp_ids), seq_len - out_keep - 1))
+            out_trunc = out_ids[:out_keep]
+            input_ids: List[int] = inp_ids[:inp_keep] + out_trunc + [eos_id]
+            labels: List[int] = [-100] * inp_keep + out_trunc + [eos_id]
             return {"input_ids": input_ids, "labels": labels}
         train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
         dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
@@ -93,10 +97,13 @@ def build_hf_dataloaders(
             enc_out = tok(out, truncation=True, max_length=seq_len, add_special_tokens=False)
             inp_ids = list(map(int, cast(List[int], enc_inp["input_ids"])))
             out_ids = list(map(int, cast(List[int], enc_out["input_ids"])))
-            input_ids: List[int] = inp_ids + out_ids + [eos_id]
-            labels: List[int] = [-100] * len(inp_ids) + out_ids + [eos_id]
-            input_ids = input_ids[:seq_len]
-            labels = labels[:seq_len]
+            if len(out_ids) == 0:
+                out_ids = [eos_id]
+            out_keep = max(1, min(len(out_ids), seq_len - 1))
+            inp_keep = max(0, min(len(inp_ids), seq_len - out_keep - 1))
+            out_trunc = out_ids[:out_keep]
+            input_ids: List[int] = inp_ids[:inp_keep] + out_trunc + [eos_id]
+            labels: List[int] = [-100] * inp_keep + out_trunc + [eos_id]
             return {"input_ids": input_ids, "labels": labels}
         train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
         dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
@@ -112,10 +119,13 @@ def build_hf_dataloaders(
             enc_out = tok(tgt, truncation=True, max_length=seq_len, add_special_tokens=False)
             inp_ids = list(map(int, cast(List[int], enc_inp["input_ids"])))
             out_ids = list(map(int, cast(List[int], enc_out["input_ids"])))
-            input_ids: List[int] = inp_ids + out_ids + [eos_id]
-            labels: List[int] = [-100] * len(inp_ids) + out_ids + [eos_id]
-            input_ids = input_ids[:seq_len]
-            labels = labels[:seq_len]
+            if len(out_ids) == 0:
+                out_ids = [eos_id]
+            out_keep = max(1, min(len(out_ids), seq_len - 1))
+            inp_keep = max(0, min(len(inp_ids), seq_len - out_keep - 1))
+            out_trunc = out_ids[:out_keep]
+            input_ids: List[int] = inp_ids[:inp_keep] + out_trunc + [eos_id]
+            labels: List[int] = [-100] * inp_keep + out_trunc + [eos_id]
             return {"input_ids": input_ids, "labels": labels}
         train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
         dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))

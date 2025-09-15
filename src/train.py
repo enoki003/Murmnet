@@ -1,8 +1,10 @@
 from __future__ import annotations
 import argparse
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, cast, Protocol, Mapping
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Tuple, cast, Protocol, Mapping, TypedDict, Any
+from collections import OrderedDict as _OrderedDict  # for typing only
 import importlib
+import os
 
 import torch
 import torch.nn as nn
@@ -62,38 +64,120 @@ class TrainConfig:
     eval_fraction: float
     max_train_samples: int
     max_eval_samples: int
+    # I/O
+    save_dir: str
+    eval_only: bool
+    ckpt_path: str
 
 
-MODEL_SIZES = {
-    "tiny": dict(hidden_dim=384, ffn_dim=1536, num_layers=4),
-    "small": dict(hidden_dim=768, ffn_dim=3072, num_layers=6),
-    "base": dict(hidden_dim=1024, ffn_dim=4096, num_layers=8),
+class _SizeSpec(TypedDict):
+    hidden_dim: int
+    ffn_dim: int
+    num_layers: int
+
+
+MODEL_SIZES: Dict[str, _SizeSpec] = {
+    "tiny": {"hidden_dim": 384, "ffn_dim": 1536, "num_layers": 4},
+    "small": {"hidden_dim": 768, "ffn_dim": 3072, "num_layers": 6},
+    "base": {"hidden_dim": 1024, "ffn_dim": 4096, "num_layers": 8},
 }
 
 
 def make_model(cfg: TrainConfig, vocab_size: Optional[int] = None) -> TinyMoETransformer:
     base = MODEL_SIZES[cfg.model_size]
+    hidden_dim: int = int(base["hidden_dim"])
+    ffn_dim: int = int(base["ffn_dim"])
+    num_layers: int = int(base["num_layers"])
+    v_size: int = int(vocab_size) if vocab_size is not None else 32000
     mcfg = MoEConfig(
         model_size=cfg.model_size,
-        hidden_dim=base["hidden_dim"],
-        ffn_dim=base["ffn_dim"],
-        num_layers=base["num_layers"],
-        num_experts=cfg.num_experts,
-        top_k=cfg.top_k,
-        router_dropout=cfg.router_dropout,
-    load_balance_coef=cfg.load_balance_coef,
-    vocab_size=vocab_size or 32000,
-    # Switch-style extras
-    capacity_factor_train=cfg.capacity_factor_train,
-    capacity_factor_eval=cfg.capacity_factor_eval,
-    switch_mode=cfg.switch_mode,
-    drop_tokens=cfg.drop_tokens,
-    use_second_choice=cfg.use_second_choice,
-    router_noise_std=cfg.router_noise_std,
-    temperature=cfg.temperature,
-    fallback_self_ffn=cfg.fallback_self_ffn,
+        hidden_dim=hidden_dim,
+        ffn_dim=ffn_dim,
+        num_layers=num_layers,
+        num_experts=int(cfg.num_experts),
+        top_k=int(cfg.top_k),
+        router_dropout=float(cfg.router_dropout),
+        load_balance_coef=float(cfg.load_balance_coef),
+        vocab_size=v_size,
+        # Switch-style extras
+        capacity_factor_train=float(cfg.capacity_factor_train),
+        capacity_factor_eval=float(cfg.capacity_factor_eval),
+        switch_mode=bool(cfg.switch_mode),
+        drop_tokens=bool(cfg.drop_tokens),
+        use_second_choice=bool(cfg.use_second_choice),
+        router_noise_std=float(cfg.router_noise_std),
+        temperature=float(cfg.temperature),
+        fallback_self_ffn=bool(cfg.fallback_self_ffn),
     )
     return TinyMoETransformer(mcfg)
+
+
+# ---- Typed checkpoint helpers (for Pylance friendliness) ----
+class ModelCfgDict(TypedDict, total=False):
+    model_size: str
+    hidden_dim: int
+    ffn_dim: int
+    num_layers: int
+    num_experts: int
+    top_k: int
+    router_dropout: float
+    load_balance_coef: float
+    vocab_size: int
+    max_position: int
+    capacity_factor: float
+    capacity_factor_train: float
+    capacity_factor_eval: float
+    switch_mode: bool
+    drop_tokens: bool
+    use_second_choice: bool
+    router_noise_std: float
+    temperature: float
+    fallback_self_ffn: bool
+
+
+class CkptPayload(TypedDict, total=False):
+    model_state_dict: Mapping[str, torch.Tensor] | _OrderedDict[str, torch.Tensor]
+    model_cfg: ModelCfgDict
+    train_cfg: Dict[str, Any]
+
+
+def load_checkpoint(path: str, device: torch.device) -> CkptPayload:
+    """Typed wrapper around torch.load for checkpoint payloads."""
+    _load = getattr(torch, "load")  # type: ignore[no-redef]
+    obj = _load(path, map_location=device)  # type: ignore[no-any-return]
+    # Best-effort cast
+    return cast(CkptPayload, obj)
+
+
+def save_checkpoint(payload: CkptPayload, path: str) -> None:
+    """Typed wrapper around torch.save for checkpoint payloads."""
+    _save = getattr(torch, "save")  # type: ignore[no-redef]
+    _save(payload, path)  # type: ignore[no-untyped-call]
+
+
+def rebuild_moe_config(m: Mapping[str, Any]) -> MoEConfig:
+    """Rebuild MoEConfig from a generic mapping with explicit typing to appease type checkers."""
+    return MoEConfig(
+        model_size=str(m.get("model_size", "small")),
+        hidden_dim=int(m.get("hidden_dim", 768)),
+        ffn_dim=int(m.get("ffn_dim", 3072)),
+        num_layers=int(m.get("num_layers", 6)),
+        num_experts=int(m.get("num_experts", 8)),
+        top_k=int(m.get("top_k", 1)),
+        router_dropout=float(m.get("router_dropout", 0.1)),
+        load_balance_coef=float(m.get("load_balance_coef", 0.01)),
+        vocab_size=int(m.get("vocab_size", 32000)),
+        max_position=int(m.get("max_position", 2048)),
+        capacity_factor=float(m.get("capacity_factor", 1.25)),
+        capacity_factor_train=float(m.get("capacity_factor_train", 1.25)),
+        capacity_factor_eval=float(m.get("capacity_factor_eval", 1.0)),
+        switch_mode=bool(m.get("switch_mode", False)),
+        drop_tokens=bool(m.get("drop_tokens", True)),
+        use_second_choice=bool(m.get("use_second_choice", True)),
+        router_noise_std=float(m.get("router_noise_std", 0.0)),
+        temperature=float(m.get("temperature", 1.0)),
+        fallback_self_ffn=bool(m.get("fallback_self_ffn", True)),
+    )
 
 
 def parse_args() -> TrainConfig:
@@ -136,6 +220,10 @@ def parse_args() -> TrainConfig:
     p.add_argument("--eval_fraction", type=float, default=1.0, help="Use this fraction of the eval set (0-1]")
     p.add_argument("--max_train_samples", type=int, default=0, help="Cap the number of training samples (0=disabled)")
     p.add_argument("--max_eval_samples", type=int, default=0, help="Cap the number of eval samples (0=disabled)")
+    # I/O options
+    p.add_argument("--save_dir", type=str, default="", help="Directory to save final checkpoint (if non-empty)")
+    p.add_argument("--eval_only", type=lambda x: x.lower() == "true", default=False, help="Load checkpoint and run evaluation only")
+    p.add_argument("--ckpt_path", type=str, default="", help="Path to a checkpoint .pt to load (required for --eval_only)")
     a = p.parse_args()
     return TrainConfig(**vars(a))
 
@@ -203,7 +291,26 @@ def main():
         print("[hf_moe] sample:", text)
         raise SystemExit("hf_moe backend is inference-only for now. Use --backend tiny to train.")
 
-    opt = AdamW(model.parameters(), lr=cfg.lr)
+    # 評価専用モード: 先にチェックポイントをロード
+    if cfg.eval_only:
+        if not cfg.ckpt_path:
+            raise SystemExit("--eval_only requires --ckpt_path to be set")
+        ckpt = load_checkpoint(cfg.ckpt_path, device)
+        mcfg_opt = ckpt.get("model_cfg")
+        if mcfg_opt is not None:
+            # 型安全に再構築してロード
+            model = TinyMoETransformer(rebuild_moe_config(mcfg_opt)).to(device)
+        state = ckpt.get("model_state_dict")
+        if isinstance(state, Mapping):
+            state_t = cast(Mapping[str, torch.Tensor], state)
+            model.load_state_dict(state_t)
+        model.eval()
+        # 直後に評価セクションへジャンプ
+        goto_eval = True
+    else:
+        goto_eval = False
+
+    opt = AdamW(model.parameters(), lr=cfg.lr) if not goto_eval else AdamW(model.parameters(), lr=cfg.lr)
     ce = nn.CrossEntropyLoss(ignore_index=-100)
     # Boids (router level)
     boids_router = BoidsRouterLoss(
@@ -228,94 +335,111 @@ def main():
     total_steps = cfg.train_epochs * len(train_loader)
     scaler = AmpGradScaler(enabled=torch.cuda.is_available())
 
-    for epoch in range(cfg.train_epochs):
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}")
-        opt.zero_grad(set_to_none=True)
-        for it, batch in enumerate(pbar):
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            # Mixed precision forward
-            amp_ctx = amp_autocast(device_type="cuda", enabled=torch.cuda.is_available()) if torch.cuda.is_available() else nullcontext()
-            with amp_ctx:
-                out = model(input_ids, return_hidden=True)
-                logits, util, hidden, moe_stats = cast(
-                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]],
-                    out,
-                )
-                # LM CE (shifted)
-                bsz, tsz, vsz = logits.shape
-                loss_ce = ce(logits.view(bsz * tsz, vsz), labels.view(bsz * tsz))
-                # Switch Aux LB: sum over MoE layers of (num_experts * (f_e * P_e).sum())
-                loss_moe = torch.tensor(0.0, device=device)
-                if len(moe_stats) > 0:
-                    for st in moe_stats:
-                        f = st["f"]  # fraction routed by primary choice
-                        P = st["P"]  # mean soft gate prob
-                        loss_moe = loss_moe + cfg.load_balance_coef * (model.cfg.num_experts * (f * P).sum())
-                else:
-                    # Fallback proxy if no stats available
-                    loss_moe = cfg.load_balance_coef * (util * util).sum()
-                loss_boids = torch.tensor(0.0, device=device)
-                if boids is not None:
-                    boids.step(global_step, total_steps)
-                    # Use last hidden states as features (compact)
-                    loss_boids = boids(hidden)
-                # Router-level Boids on gates if available (best-effort)
-                loss_boids_router = torch.tensor(0.0, device=device)
-                if boids_router is not None:
-                    # Router-level Boids on actual last MoE layer gates
-                    z = hidden.reshape(bsz * tsz, -1)
+    if not goto_eval:
+        for epoch in range(cfg.train_epochs):
+            pbar = tqdm(train_loader, desc=f"epoch {epoch}")
+            opt.zero_grad(set_to_none=True)
+            for it, batch in enumerate(pbar):
+                input_ids = batch["input_ids"].to(device)
+                labels = batch["labels"].to(device)
+                # Mixed precision forward
+                amp_ctx = amp_autocast(device_type="cuda", enabled=torch.cuda.is_available()) if torch.cuda.is_available() else nullcontext()
+                with amp_ctx:
+                    out = model(input_ids, return_hidden=True)
+                    logits, util, hidden, moe_stats = cast(
+                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]],
+                        out,
+                    )
+                    # LM CE (shifted)
+                    bsz, tsz, vsz = logits.shape
+                    loss_ce = ce(logits.view(bsz * tsz, vsz), labels.view(bsz * tsz))
+                    # Switch Aux LB: sum over MoE layers of (num_experts * (f_e * P_e).sum())
+                    loss_moe = torch.tensor(0.0, device=device)
                     if len(moe_stats) > 0:
-                        last = moe_stats[-1]
-                        gates_soft = last["gates_soft"]  # (N,E)
-                        topk_idx = last["topk_idx"]  # (N,K)
+                        for st in moe_stats:
+                            f = st["f"]  # fraction routed by primary choice
+                            P = st["P"]  # mean soft gate prob
+                            loss_moe = loss_moe + cfg.load_balance_coef * (model.cfg.num_experts * (f * P).sum())
                     else:
-                        gates_soft = torch.full((bsz * tsz, model.cfg.num_experts), 1.0 / model.cfg.num_experts, device=device)
-                        topk_idx = torch.zeros(bsz * tsz, model.cfg.top_k, dtype=torch.long, device=device)
-                    br = boids_router(z, gates_soft, topk_idx, model.cfg.num_experts)
-                    loss_boids_router = br["boids"]
-                loss: torch.Tensor = loss_ce + loss_moe + loss_boids + loss_boids_router
+                        # Fallback proxy if no stats available
+                        loss_moe = cfg.load_balance_coef * (util * util).sum()
+                    loss_boids = torch.tensor(0.0, device=device)
+                    if boids is not None:
+                        boids.step(global_step, total_steps)
+                        # Use last hidden states as features (compact)
+                        loss_boids = boids(hidden)
+                    # Router-level Boids on gates if available (best-effort)
+                    loss_boids_router = torch.tensor(0.0, device=device)
+                    if boids_router is not None:
+                        # Router-level Boids on actual last MoE layer gates
+                        z = hidden.reshape(bsz * tsz, -1)
+                        if len(moe_stats) > 0:
+                            last = moe_stats[-1]
+                            gates_soft = last["gates_soft"]  # (N,E)
+                            topk_idx = last["topk_idx"]  # (N,K)
+                        else:
+                            gates_soft = torch.full((bsz * tsz, model.cfg.num_experts), 1.0 / model.cfg.num_experts, device=device)
+                            topk_idx = torch.zeros(bsz * tsz, model.cfg.top_k, dtype=torch.long, device=device)
+                        br = boids_router(z, gates_soft, topk_idx, model.cfg.num_experts)
+                        loss_boids_router = br["boids"]
+                    loss: torch.Tensor = loss_ce + loss_moe + loss_boids + loss_boids_router
 
-            # NaN/Inf guard on loss (pre-backward)
-            if cfg.nan_guard and not bool(torch.isfinite(loss)):
-                # Skip this batch safely
-                opt.zero_grad(set_to_none=True)
-                # Minimal, impersonal notice
-                print(f"[nan-guard] non-finite loss at step {global_step}, batch {it}: skip")
-                scaler.update()
-                continue
+                # NaN/Inf guard on loss (pre-backward)
+                if cfg.nan_guard and not bool(torch.isfinite(loss)):
+                    # Skip this batch safely
+                    opt.zero_grad(set_to_none=True)
+                    # Minimal, impersonal notice
+                    print(f"[nan-guard] non-finite loss at step {global_step}, batch {it}: skip")
+                    scaler.update()
+                    continue
 
-            # mypy/pyright: scale() return type lacks backward signature -> cast via a tiny protocol
-            class _BackpropLike(Protocol):
-                def backward(self) -> None: ...
-            scaled = cast(_BackpropLike, scaler.scale(loss / cfg.accum_steps))
-            scaled.backward()
-            if (it + 1) % cfg.accum_steps == 0:
-                scaler.unscale_(opt)
-                # Optional: check grads before stepping
-                if cfg.nan_guard:
-                    any_bad = False
-                    for p in model.parameters():
-                        if p.grad is None:
+                # mypy/pyright: scale() return type lacks backward signature -> cast via a tiny protocol
+                class _BackpropLike(Protocol):
+                    def backward(self) -> None: ...
+                scaled = cast(_BackpropLike, scaler.scale(loss / cfg.accum_steps))
+                scaled.backward()
+                if (it + 1) % cfg.accum_steps == 0:
+                    scaler.unscale_(opt)
+                    # Optional: check grads before stepping
+                    if cfg.nan_guard:
+                        any_bad = False
+                        for p in model.parameters():
+                            if p.grad is None:
+                                continue
+                            g = p.grad
+                            if not bool(torch.isfinite(g).all()):
+                                any_bad = True
+                                break
+                        if any_bad:
+                            opt.zero_grad(set_to_none=True)
+                            scaler.update()
+                            print(f"[nan-guard] non-finite grad at step {global_step}: skip step")
                             continue
-                        g = p.grad
-                        if not bool(torch.isfinite(g).all()):
-                            any_bad = True
-                            break
-                    if any_bad:
-                        opt.zero_grad(set_to_none=True)
-                        scaler.update()
-                        print(f"[nan-guard] non-finite grad at step {global_step}: skip step")
-                        continue
-                clip_grad_norm(model.parameters(), 1.0)
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
-            global_step += 1
-            postfix: Dict[str, object] = {"loss": float(loss.item()), "boids": float(loss_boids.item()) if boids else 0.0}
-            class _TqdmLike(Protocol):
-                def set_postfix(self, ordered_dict: Mapping[str, object] | None = ..., refresh: Optional[bool] = True, **kwargs: object) -> None: ...
-            cast(_TqdmLike, pbar).set_postfix(postfix)
+                    clip_grad_norm(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad(set_to_none=True)
+                global_step += 1
+                postfix: Dict[str, object] = {"loss": float(loss.item()), "boids": float(loss_boids.item()) if boids else 0.0}
+                class _TqdmLike(Protocol):
+                    def set_postfix(self, ordered_dict: Mapping[str, object] | None = ..., refresh: Optional[bool] = True, **kwargs: object) -> None: ...
+                cast(_TqdmLike, pbar).set_postfix(postfix)
+
+    # 学習後にチェックポイント保存（任意）
+    if (not goto_eval) and cfg.save_dir:
+        try:
+            os.makedirs(cfg.save_dir, exist_ok=True)
+            ckpt_path = os.path.join(cfg.save_dir, "checkpoint.pt")
+            mcfg_dict: ModelCfgDict = cast(ModelCfgDict, asdict(model.cfg))
+            payload: CkptPayload = {
+                "model_state_dict": cast(Mapping[str, torch.Tensor], model.state_dict()),
+                "model_cfg": mcfg_dict,
+                "train_cfg": asdict(cfg),
+            }
+            save_checkpoint(payload, ckpt_path)
+            print(f"[save] checkpoint: {ckpt_path}")
+        except Exception as e:
+            print(f"[save] failed: {e}")
 
     # Quick eval: self-consistency via multiple stochastic passes (dropout active)
     # Enable dropout for stochasticity during self-consistency measurement
