@@ -96,6 +96,7 @@ def build_demo():
     model.to(cfg.device)
 
     gr = importlib.import_module("gradio")
+
     with gr.Blocks(title="MurmNet TinyMoE Chat") as demo:
         gr.Markdown("# MurmNet TinyMoE Chat\n小型MoEトランスフォーマでローカル会話")
         chatbot = gr.Chatbot(type="messages", height=400)
@@ -104,10 +105,10 @@ def build_demo():
             send = gr.Button("送信", variant="primary", scale=1)
         temperature = gr.Slider(0.2, 1.5, value=cfg.temperature, step=0.05, label="Temperature")
         max_new = gr.Slider(8, 256, value=cfg.max_new_tokens, step=8, label="Max new tokens")
-
         state = gr.State({"cfg": cfg, "tok": tok, "model": model})
 
-    def respond(
+        # define callback inside Blocks context
+        def respond(
             user_message: str,
             chat_history: Optional[List[Dict[str, str]]],
             temperature: float,
@@ -139,8 +140,9 @@ def build_demo():
             ]
             return new_history, st
 
-    send.click(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
-    msg.submit(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
+        # bind events inside Blocks context
+        send.click(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
+        msg.submit(respond, inputs=[msg, chatbot, temperature, max_new, state], outputs=[chatbot, state])
 
     return cast(_BlocksLike, demo)
 

@@ -33,6 +33,11 @@ def run_once(args: List[str]) -> Dict[str, Any]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", choices=["fast", "full"], default="fast")
+    # Optional subsampling for quicker runs
+    ap.add_argument("--train_fraction", type=float, default=None)
+    ap.add_argument("--eval_fraction", type=float, default=None)
+    ap.add_argument("--max_train_samples", type=int, default=None)
+    ap.add_argument("--max_eval_samples", type=int, default=None)
     args = ap.parse_args()
 
     if args.preset == "full":
@@ -49,6 +54,15 @@ def main() -> None:
             "--backend", "tiny",
             "--seed", "42",
     ]
+    # Forward subsampling flags if provided
+    if args.train_fraction is not None:
+        base += ["--train_fraction", str(args.train_fraction)]
+    if args.eval_fraction is not None:
+        base += ["--eval_fraction", str(args.eval_fraction)]
+    if args.max_train_samples is not None:
+        base += ["--max_train_samples", str(args.max_train_samples)]
+    if args.max_eval_samples is not None:
+        base += ["--max_eval_samples", str(args.max_eval_samples)]
 
     # none: no aux losses
     none_args = base + ["--load_balance_coef", "0.0", "--boids_on", "false"]
@@ -69,7 +83,10 @@ def main() -> None:
         "normal": m_norm,
         "boids": m_boids,
     }
+    # Human-readable
     print(json.dumps(out, ensure_ascii=False, indent=2))
+    # Machine-friendly (UI parses the last line as one-line JSON)
+    print(json.dumps(out, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,6 @@ import torch.nn as nn
 from torch.optim.adamw import AdamW
 from torch.nn.utils import clip_grad_norm_ as clip_grad_norm
 from tqdm import tqdm
-from torch.utils.data import DataLoader
 from torch.amp.autocast_mode import autocast as amp_autocast
 from torch.amp.grad_scaler import GradScaler as AmpGradScaler
 from contextlib import nullcontext
@@ -48,6 +47,21 @@ class TrainConfig:
     device: str
     backend: str
     seed: int
+    nan_guard: bool
+    # Switch-Transformer style router/MoE options
+    switch_mode: bool
+    capacity_factor_train: float
+    capacity_factor_eval: float
+    drop_tokens: bool
+    use_second_choice: bool
+    router_noise_std: float
+    temperature: float
+    fallback_self_ffn: bool
+    # Data subsampling
+    train_fraction: float
+    eval_fraction: float
+    max_train_samples: int
+    max_eval_samples: int
 
 
 MODEL_SIZES = {
@@ -69,6 +83,15 @@ def make_model(cfg: TrainConfig, vocab_size: Optional[int] = None) -> TinyMoETra
         router_dropout=cfg.router_dropout,
     load_balance_coef=cfg.load_balance_coef,
     vocab_size=vocab_size or 32000,
+    # Switch-style extras
+    capacity_factor_train=cfg.capacity_factor_train,
+    capacity_factor_eval=cfg.capacity_factor_eval,
+    switch_mode=cfg.switch_mode,
+    drop_tokens=cfg.drop_tokens,
+    use_second_choice=cfg.use_second_choice,
+    router_noise_std=cfg.router_noise_std,
+    temperature=cfg.temperature,
+    fallback_self_ffn=cfg.fallback_self_ffn,
     )
     return TinyMoETransformer(mcfg)
 
@@ -98,6 +121,21 @@ def parse_args() -> TrainConfig:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--backend", type=str, default="tiny", choices=["tiny", "hf_moe"], help="Model backend: tiny (this repo) or hf_moe (stub)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--nan_guard", type=lambda x: x.lower() == "true", default=True, help="Guard against NaN/Inf loss and grads by skipping the step")
+    # Switch-Transformer style router/MoE options
+    p.add_argument("--switch_mode", type=lambda x: x.lower() == "true", default=False, help="Enable Switch-style top-1 routing with capacity and dropping")
+    p.add_argument("--capacity_factor_train", type=float, default=1.25)
+    p.add_argument("--capacity_factor_eval", type=float, default=1.0)
+    p.add_argument("--drop_tokens", type=lambda x: x.lower() == "true", default=True)
+    p.add_argument("--use_second_choice", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--router_noise_std", type=float, default=0.0)
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--fallback_self_ffn", type=lambda x: x.lower() == "true", default=True, help="Fallback dense FFN for overflow tokens (ignored when switch_mode=true)")
+    # Data subsampling options
+    p.add_argument("--train_fraction", type=float, default=1.0, help="Use this fraction of the training set (0-1]")
+    p.add_argument("--eval_fraction", type=float, default=1.0, help="Use this fraction of the eval set (0-1]")
+    p.add_argument("--max_train_samples", type=int, default=0, help="Cap the number of training samples (0=disabled)")
+    p.add_argument("--max_eval_samples", type=int, default=0, help="Cap the number of eval samples (0=disabled)")
     a = p.parse_args()
     return TrainConfig(**vars(a))
 
@@ -106,62 +144,63 @@ def main():
     cfg = parse_args()
     device = torch.device(cfg.device)
     # Reproducibility (best-effort)
-    torch.manual_seed(cfg.seed)
+    # Use getattr to appease strict type checkers on torch stubs
+    getattr(torch, "manual_seed")(int(cfg.seed))
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.seed)
+        getattr(torch.cuda, "manual_seed_all")(int(cfg.seed))
     # Data & tokenizer (HF only)
     tok: PreTrainedTokenizerBase
     from .data import hf_loader as _hf_loader
     train_loader, dev_loader, tok = _hf_loader.build_hf_dataloaders(
-        cfg.task, cfg.dataset_size, cfg.seq_len, cfg.micro_batch
+        cfg.task,
+        cfg.dataset_size,
+        cfg.seq_len,
+        cfg.micro_batch,
+        0,
+        cfg.train_fraction,
+        cfg.eval_fraction,
+        cfg.max_train_samples,
+        cfg.max_eval_samples,
     )
-    # Type hints for analyzers
-    train_loader: DataLoader[Dict[str, torch.Tensor]] = train_loader
-    dev_loader: DataLoader[Dict[str, torch.Tensor]] = dev_loader
 
     if cfg.backend == "tiny":
-        vocab_sz: Optional[int] = len(tok.get_vocab()) if hasattr(tok, "get_vocab") else None
+        vocab_sz: Optional[int] = None
+        _gv = getattr(tok, "get_vocab", None)
+        if callable(_gv):
+            try:
+                v = cast(Dict[str, int], _gv())
+                vocab_sz = int(len(v))
+            except Exception:
+                vocab_sz = None
         model = make_model(cfg, vocab_size=vocab_sz).to(device)
     else:
-        # HF backend: 現状は学習未対応。CausalLMで簡易サンプル生成のみ実施して終了。
+        # HF backend: 学習未対応。google/switch-base-16 を読み込み、Seq2Seqの簡易生成デモのみ実施して終了。
         class _HFTokenizer(Protocol):
             def __call__(self, text: str, *, return_tensors: str, add_special_tokens: bool = ...) -> Mapping[str, torch.Tensor]: ...
             def decode(self, token_ids: List[int] | torch.Tensor, *, skip_special_tokens: bool = ...) -> str: ...
             eos_token_id: Optional[int]
 
-        class _CausalLMOut(Protocol):
-            logits: torch.Tensor
+        class _HFSeq2Seq(Protocol):
+            def generate(self, input_ids: torch.Tensor, **kwargs: object) -> torch.Tensor: ...
+            def to(self, device: torch.device | str) -> "_HFSeq2Seq": ...
+            def eval(self) -> "_HFSeq2Seq": ...
 
-        class _HFCausalLM(Protocol):
-            def __call__(self, input_ids: torch.Tensor) -> _CausalLMOut: ...
-            def to(self, device: torch.device | str) -> "_HFCausalLM": ...
-            def eval(self) -> "_HFCausalLM": ...
-
-        model_name = "gpt2"
+        model_name = "google/switch-base-16"
         tok_mod = importlib.import_module("transformers.models.auto.tokenization_auto")
         AutoTokenizer = getattr(tok_mod, "AutoTokenizer")
         tkn = cast(_HFTokenizer, AutoTokenizer.from_pretrained(model_name))
-        pad_tok = getattr(tkn, "eos_token", None) or getattr(tkn, "unk_token", None)
-        if getattr(tkn, "pad_token", None) is None and pad_tok is not None:
-            setattr(tkn, "pad_token", pad_tok)
         mdl_mod = importlib.import_module("transformers.models.auto.modeling_auto")
-        AutoModelForCausalLM = getattr(mdl_mod, "AutoModelForCausalLM")
-        mdl = cast(_HFCausalLM, AutoModelForCausalLM.from_pretrained(model_name)).to(device)
+        AutoModelForSeq2SeqLM = getattr(mdl_mod, "AutoModelForSeq2SeqLM")
+        mdl = cast(_HFSeq2Seq, AutoModelForSeq2SeqLM.from_pretrained(model_name)).to(device)
         mdl = mdl.eval()
-        prompt = "Hello from MurmNet!"  # 簡易デモ
+
+        prompt = "summarize: Hugging Face is a platform for ML models and datasets."
         with torch.no_grad():
-            enc = tkn(prompt, return_tensors="pt", add_special_tokens=False)
+            enc = tkn(prompt, return_tensors="pt", add_special_tokens=True)
             input_ids = enc["input_ids"].to(device)
-            for _ in range(32):
-                out: _CausalLMOut = mdl(input_ids)
-                next_logits = out.logits[:, -1, :]
-                next_id = next_logits.softmax(-1).multinomial(1)
-                input_ids = torch.cat([input_ids, next_id], dim=1)
-                if getattr(tkn, "eos_token_id", None) is not None and int(next_id.item()) == int(getattr(tkn, "eos_token_id")):
-                    break
-            ids_list: List[int] = [int(x) for x in input_ids[0]]
-            text = tkn.decode(ids_list, skip_special_tokens=True)
-        print("[hf_moe] sample:", text[len(prompt):])
+            gen = mdl.generate(input_ids, max_new_tokens=64, do_sample=False)
+            text = tkn.decode(gen[0], skip_special_tokens=True)
+        print("[hf_moe] sample:", text)
         raise SystemExit("hf_moe backend is inference-only for now. Use --backend tiny to train.")
 
     opt = AdamW(model.parameters(), lr=cfg.lr)
@@ -187,7 +226,7 @@ def main():
     model.train()
     global_step = 0
     total_steps = cfg.train_epochs * len(train_loader)
-    scaler = AmpGradScaler("cuda", enabled=torch.cuda.is_available())
+    scaler = AmpGradScaler(enabled=torch.cuda.is_available())
 
     for epoch in range(cfg.train_epochs):
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
@@ -237,6 +276,15 @@ def main():
                     loss_boids_router = br["boids"]
                 loss: torch.Tensor = loss_ce + loss_moe + loss_boids + loss_boids_router
 
+            # NaN/Inf guard on loss (pre-backward)
+            if cfg.nan_guard and not bool(torch.isfinite(loss)):
+                # Skip this batch safely
+                opt.zero_grad(set_to_none=True)
+                # Minimal, impersonal notice
+                print(f"[nan-guard] non-finite loss at step {global_step}, batch {it}: skip")
+                scaler.update()
+                continue
+
             # mypy/pyright: scale() return type lacks backward signature -> cast via a tiny protocol
             class _BackpropLike(Protocol):
                 def backward(self) -> None: ...
@@ -244,6 +292,21 @@ def main():
             scaled.backward()
             if (it + 1) % cfg.accum_steps == 0:
                 scaler.unscale_(opt)
+                # Optional: check grads before stepping
+                if cfg.nan_guard:
+                    any_bad = False
+                    for p in model.parameters():
+                        if p.grad is None:
+                            continue
+                        g = p.grad
+                        if not bool(torch.isfinite(g).all()):
+                            any_bad = True
+                            break
+                    if any_bad:
+                        opt.zero_grad(set_to_none=True)
+                        scaler.update()
+                        print(f"[nan-guard] non-finite grad at step {global_step}: skip step")
+                        continue
                 clip_grad_norm(model.parameters(), 1.0)
                 scaler.step(opt)
                 scaler.update()

@@ -29,6 +29,7 @@ python -m src.train \
   --num_experts 8 --top_k 1 \
   --seq_len 512 \
   --train_epochs 1 \
+  --train_fraction 0.1 --eval_fraction 0.2 `# データを間引いて高速化 (任意)` \
   --boids_on true \
   --boids_lambda_c 0.1 --boids_lambda_s 0.05 --boids_lambda_a 0.01 \
   --router_dropout 0.1 --load_balance_coef 0.01 \
@@ -49,6 +50,7 @@ python -m src.train --task sst2 --dataset_size small --model_size tiny --seq_len
 
 - 本リポはWindows対応を考慮し、DataLoaderのワーカ数は既定で0に設定しています（マルチプロセスのpickle問題回避）。
 - `--dataset_size` は `small`/`full`。ダミーデータは廃止しました。
+- さらに高速化したい場合は、`--train_fraction/--eval_fraction`（0<frac<=1）や `--max_train_samples/--max_eval_samples` でサンプル数を制限できます。
 
 ## バックエンド切替（学習: tiny / 推論デモ: hf_moe）
 

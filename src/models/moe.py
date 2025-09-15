@@ -128,77 +128,26 @@ class MoELayer(_ModuleBase):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         B, T, H = x.shape
-        # In Switch mode, enforce top-1 regardless of config.top_k
-        if self.switch_mode and self.router.top_k != 1:
-            self.router.set_top_k(1)
-        gates, idx, logits = self.router(x)  # (B, T, E), (B, T, K), (B, T, E)
+        # シンプルな top-k ソフトゲーティング: 全専門家を計算し、gatesで加重平均
+        # ルーターからの出力
+        gates, idx, logits = self.router(x)  # (B,T,E), (B,T,K), (B,T,E)
         N = B * T
         gates_f = gates.view(N, self.num_experts)
-        k_actual = idx.size(-1)
-        idx_f = idx.view(N, k_actual)
         x_f = x.view(N, H)
-        device = x.device
-        # Capacity per expert (Switch uses separate train/eval factors)
-        cf = self.capacity_factor_train if self.training else self.capacity_factor_eval
-        cap = max(1, int((N / self.num_experts) * cf))
-        primary = idx_f[:, 0]
-        keep_primary = torch.zeros(N, dtype=torch.bool, device=device)
-        assign = torch.full((N,), -1, dtype=torch.long, device=device)
-        used = torch.zeros(self.num_experts, dtype=torch.long, device=device)
-        for e in range(self.num_experts):
-            mask_e = (primary == e).nonzero(as_tuple=False).squeeze(-1)
-            if mask_e.numel() == 0:
-                continue
-            free = max(0, cap - int(used[e].item()))
-            n = int(min(free, mask_e.numel()))
-            if n > 0:
-                sel = mask_e[:n]
-                keep_primary[sel] = True
-                assign[sel] = e
-                used[e] += n
-        # Backup to second expert (disabled in Switch mode)
-        overflow = ~keep_primary
-        if (not self.switch_mode) and self.use_second_choice and (k_actual > 1):
-            second = idx_f[:, 1]
-            for e in range(self.num_experts):
-                if used[e] >= cap:
-                    continue
-                mask_e = ((second == e) & overflow).nonzero(as_tuple=False).squeeze(-1)
-                if mask_e.numel() == 0:
-                    continue
-                free = cap - int(used[e].item())
-                n = int(min(free, mask_e.numel()))
-                if n > 0:
-                    sel = mask_e[:n]
-                    assign[sel] = e
-                    used[e] += n
-                    overflow[sel] = False
-        # Fallback to self FFN (disabled in Switch mode by default)
-        use_fallback = overflow & (self.self_ffn is not None) if (not self.switch_mode) else torch.zeros_like(overflow)
-
-        # Compute expert outputs (simple full compute)
+        # 専門家の一括前方
         expert_outputs = [self.experts[e](x_f) for e in range(self.num_experts)]
-        expert_stack = torch.stack(expert_outputs, dim=1)  # (N, E, H)
-        one_hot = torch.zeros(N, self.num_experts, device=device, dtype=expert_stack.dtype)
-        valid = assign >= 0
-        one_hot[valid, assign[valid]] = 1.0
-        y = (expert_stack * one_hot.unsqueeze(-1)).sum(dim=1)
-        if (not self.switch_mode) and use_fallback.any():
-            assert self.self_ffn is not None
-            y_fb = self.self_ffn(x_f[use_fallback])
-            y[use_fallback] = y_fb
-        y = y.view(B, T, H)
-
-        util = one_hot.mean(dim=0)
-        # Switch aux uses f (actual fraction assigned) and P (mean soft prob)
-        f = util.detach()
-        P = gates_f.mean(dim=0)
+        expert_stack = torch.stack(expert_outputs, dim=1)  # (N,E,H)
+        # 加重和
+        y = (expert_stack * gates_f.unsqueeze(-1)).sum(dim=1).view(B, T, H)
+        # 利用率の近似（gateが正の専門家割合）
+        util = (gates_f > 0).to(expert_stack.dtype).mean(dim=0)
+        # 付随統計
         stats: Dict[str, torch.Tensor] = {
-            "f": f,
-            "P": P,
+            "f": util.detach(),
+            "P": gates_f.mean(dim=0),
             "logits": logits.view(N, self.num_experts),
             "gates_soft": gates_f,
-            "topk_idx": idx_f,
+            "topk_idx": idx.view(N, -1),
         }
         return y, util, stats
 

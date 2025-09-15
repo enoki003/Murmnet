@@ -44,6 +44,11 @@ def build_hf_dataloaders(
     seq_len: int,
     micro_batch: int,
     num_workers: int = 0,
+    # Subsampling controls (applied after encoding and size preset)
+    train_fraction: float = 1.0,
+    eval_fraction: float = 1.0,
+    max_train_samples: int = 0,
+    max_eval_samples: int = 0,
 ) -> Tuple[DataLoader[Dict[str, Tensor]], DataLoader[Dict[str, Tensor]], PreTrainedTokenizerBase]:
     # Tokenizer (English defaults)
     tok_name = "gpt2"
@@ -126,6 +131,22 @@ def build_hf_dataloaders(
     elif dataset_size == "full":
         # keep full size
         ...
+
+    # Optional subsampling by fraction and/or cap
+    def _apply_subsample(ds_sup: _SupportsHF, frac: float, cap: int) -> _SupportsHF:
+        ds_like = cast(HFDatasetLike, ds_sup)
+        n_total = len(ds_like)
+        n = n_total
+        if 0.0 < frac < 1.0:
+            n = max(1, int(n_total * frac))
+        if cap > 0:
+            n = min(n, cap)
+        if n < n_total:
+            return cast(_SupportsHF, ds_like.select(range(n)))
+        return ds_sup
+
+    train = _apply_subsample(train, train_fraction, max_train_samples)
+    dev = _apply_subsample(dev, eval_fraction, max_eval_samples)
 
     pad_raw = getattr(tok, "pad_token_id", None)
     pad_id: int = int(pad_raw) if isinstance(pad_raw, int) else eos_id
