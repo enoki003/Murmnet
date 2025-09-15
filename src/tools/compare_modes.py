@@ -4,6 +4,7 @@ import subprocess
 import sys
 import argparse
 from typing import Dict, Any, List
+import os
 
 # Run three modes of src.train and collect printed JSON-like summary
 # Modes:
@@ -13,8 +14,35 @@ from typing import Dict, Any, List
 
 
 def run_once(args: List[str]) -> Dict[str, Any]:
-    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True)
-    lines = proc.stdout.splitlines()
+    # Stream child output live to console while buffering for JSON parse at the end
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+        env=env,
+    )
+    lines: List[str] = []
+    assert proc.stdout is not None
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            # passthrough to console for progress visibility
+            print(line, end="")
+            lines.append(line.rstrip("\n"))
+    except KeyboardInterrupt:
+        proc.terminate()
+        proc.wait(timeout=5)
+        raise
+    finally:
+        proc.stdout.close()
+    ret = proc.wait()
+    if ret != 0:
+        tail = "\n".join(lines[-50:])
+        raise subprocess.CalledProcessError(ret, args, output=tail)
     # find last JSON-ish line printed by train.py (dict via print)
     parsed: Dict[str, Any] | None = None
     for i in range(len(lines) - 1, -1, -1):
@@ -90,4 +118,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    print("[deprecated] compare_modes CLI was removed; project is HF Switch-Transformer only.")
+    sys.exit(0)

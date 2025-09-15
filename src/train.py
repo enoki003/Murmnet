@@ -1,27 +1,20 @@
 from __future__ import annotations
 import argparse
-from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Tuple, cast, Protocol, Mapping, TypedDict, Any
-from collections import OrderedDict as _OrderedDict  # for typing only
-import importlib
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple, cast, Protocol, Mapping, Any
 import os
+import importlib
 
 import torch
-import torch.nn as nn
 from torch.optim.adamw import AdamW
 from torch.nn.utils import clip_grad_norm_ as clip_grad_norm
 from tqdm import tqdm
 from torch.amp.autocast_mode import autocast as amp_autocast
 from torch.amp.grad_scaler import GradScaler as AmpGradScaler
 from contextlib import nullcontext
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from .models.moe import MoEConfig, TinyMoETransformer
-from .regularizers.boids import BoidsConfig, BoidsRegularizer
-from .eval.metrics import self_consistency_rate, expert_entropy
-from .eval.moe_utils import overuse_rate
 from .eval.text_utils import ngram_repeat_rate
-from .loss.boids_router_loss import BoidsRouterLoss
+from .eval.metrics import squad_em_f1, rougeL_f1, sst2_label_from_text
 
 
 @dataclass
@@ -29,36 +22,17 @@ class TrainConfig:
     task: str
     dataset_size: str
     model_size: str
-    num_experts: int
-    top_k: int
-    router_dropout: float
-    load_balance_coef: float
+    model_id: str
     seq_len: int
     train_epochs: int
     lr: float
     micro_batch: int
     accum_steps: int
-    boids_on: bool
-    boids_lambda_c: float
-    boids_lambda_s: float
-    boids_lambda_a: float
-    boids_k_nn: int
-    boids_sep_tau: float
-    boids_warmup_frac: float
     eval_trials: int
     device: str
     backend: str
     seed: int
     nan_guard: bool
-    # Switch-Transformer style router/MoE options
-    switch_mode: bool
-    capacity_factor_train: float
-    capacity_factor_eval: float
-    drop_tokens: bool
-    use_second_choice: bool
-    router_noise_std: float
-    temperature: float
-    fallback_self_ffn: bool
     # Data subsampling
     train_fraction: float
     eval_fraction: float
@@ -68,116 +42,40 @@ class TrainConfig:
     save_dir: str
     eval_only: bool
     ckpt_path: str
+    # Logging
+    log_every: int
 
 
-class _SizeSpec(TypedDict):
-    hidden_dim: int
-    ffn_dim: int
-    num_layers: int
-
-
-MODEL_SIZES: Dict[str, _SizeSpec] = {
+MODEL_SIZES: Dict[str, Dict[str, int]] = {
     "tiny": {"hidden_dim": 384, "ffn_dim": 1536, "num_layers": 4},
     "small": {"hidden_dim": 768, "ffn_dim": 3072, "num_layers": 6},
     "base": {"hidden_dim": 1024, "ffn_dim": 4096, "num_layers": 8},
 }
 
 
-def make_model(cfg: TrainConfig, vocab_size: Optional[int] = None) -> TinyMoETransformer:
-    base = MODEL_SIZES[cfg.model_size]
-    hidden_dim: int = int(base["hidden_dim"])
-    ffn_dim: int = int(base["ffn_dim"])
-    num_layers: int = int(base["num_layers"])
-    v_size: int = int(vocab_size) if vocab_size is not None else 32000
-    mcfg = MoEConfig(
-        model_size=cfg.model_size,
-        hidden_dim=hidden_dim,
-        ffn_dim=ffn_dim,
-        num_layers=num_layers,
-        num_experts=int(cfg.num_experts),
-        top_k=int(cfg.top_k),
-        router_dropout=float(cfg.router_dropout),
-        load_balance_coef=float(cfg.load_balance_coef),
-        vocab_size=v_size,
-        # Switch-style extras
-        capacity_factor_train=float(cfg.capacity_factor_train),
-        capacity_factor_eval=float(cfg.capacity_factor_eval),
-        switch_mode=bool(cfg.switch_mode),
-        drop_tokens=bool(cfg.drop_tokens),
-        use_second_choice=bool(cfg.use_second_choice),
-        router_noise_std=float(cfg.router_noise_std),
-        temperature=float(cfg.temperature),
-        fallback_self_ffn=bool(cfg.fallback_self_ffn),
-    )
-    return TinyMoETransformer(mcfg)
+# HF save/load helpers
+class HFSeq2SeqLike(Protocol):
+    def __call__(self, *, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = ..., labels: Optional[torch.Tensor] = ...) -> Any: ...
+    def parameters(self) -> Any: ...
+    def train(self, mode: bool = ...) -> Any: ...
+    def eval(self) -> Any: ...
+    def generate(self, *, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = ..., max_new_tokens: Optional[int] = ..., do_sample: Optional[bool] = ...) -> torch.Tensor: ...
+    def save_pretrained(self, save_directory: str) -> Any: ...
 
 
-# ---- Typed checkpoint helpers (for Pylance friendliness) ----
-class ModelCfgDict(TypedDict, total=False):
-    model_size: str
-    hidden_dim: int
-    ffn_dim: int
-    num_layers: int
-    num_experts: int
-    top_k: int
-    router_dropout: float
-    load_balance_coef: float
-    vocab_size: int
-    max_position: int
-    capacity_factor: float
-    capacity_factor_train: float
-    capacity_factor_eval: float
-    switch_mode: bool
-    drop_tokens: bool
-    use_second_choice: bool
-    router_noise_std: float
-    temperature: float
-    fallback_self_ffn: bool
-
-
-class CkptPayload(TypedDict, total=False):
-    model_state_dict: Mapping[str, torch.Tensor] | _OrderedDict[str, torch.Tensor]
-    model_cfg: ModelCfgDict
-    train_cfg: Dict[str, Any]
-
-
-def load_checkpoint(path: str, device: torch.device) -> CkptPayload:
-    """Typed wrapper around torch.load for checkpoint payloads."""
-    _load = getattr(torch, "load")  # type: ignore[no-redef]
-    obj = _load(path, map_location=device)  # type: ignore[no-any-return]
-    # Best-effort cast
-    return cast(CkptPayload, obj)
-
-
-def save_checkpoint(payload: CkptPayload, path: str) -> None:
-    """Typed wrapper around torch.save for checkpoint payloads."""
-    _save = getattr(torch, "save")  # type: ignore[no-redef]
-    _save(payload, path)  # type: ignore[no-untyped-call]
-
-
-def rebuild_moe_config(m: Mapping[str, Any]) -> MoEConfig:
-    """Rebuild MoEConfig from a generic mapping with explicit typing to appease type checkers."""
-    return MoEConfig(
-        model_size=str(m.get("model_size", "small")),
-        hidden_dim=int(m.get("hidden_dim", 768)),
-        ffn_dim=int(m.get("ffn_dim", 3072)),
-        num_layers=int(m.get("num_layers", 6)),
-        num_experts=int(m.get("num_experts", 8)),
-        top_k=int(m.get("top_k", 1)),
-        router_dropout=float(m.get("router_dropout", 0.1)),
-        load_balance_coef=float(m.get("load_balance_coef", 0.01)),
-        vocab_size=int(m.get("vocab_size", 32000)),
-        max_position=int(m.get("max_position", 2048)),
-        capacity_factor=float(m.get("capacity_factor", 1.25)),
-        capacity_factor_train=float(m.get("capacity_factor_train", 1.25)),
-        capacity_factor_eval=float(m.get("capacity_factor_eval", 1.0)),
-        switch_mode=bool(m.get("switch_mode", False)),
-        drop_tokens=bool(m.get("drop_tokens", True)),
-        use_second_choice=bool(m.get("use_second_choice", True)),
-        router_noise_std=float(m.get("router_noise_std", 0.0)),
-        temperature=float(m.get("temperature", 1.0)),
-        fallback_self_ffn=bool(m.get("fallback_self_ffn", True)),
-    )
+def hf_load(model_id_or_dir: str, device: torch.device) -> Tuple[Any, HFSeq2SeqLike]:
+    tok_mod = importlib.import_module("transformers.models.auto.tokenization_auto")
+    AutoTokenizer = getattr(tok_mod, "AutoTokenizer")
+    tok: Any = AutoTokenizer.from_pretrained(model_id_or_dir)
+    if getattr(tok, "pad_token", None) is None:
+        pad_fallback = getattr(tok, "eos_token", None) or getattr(tok, "sep_token", None) or getattr(tok, "unk_token", None)
+        if pad_fallback is not None:
+            setattr(tok, "pad_token", pad_fallback)
+    mdl_mod = importlib.import_module("transformers.models.auto.modeling_auto")
+    AutoModelForSeq2SeqLM = getattr(mdl_mod, "AutoModelForSeq2SeqLM")
+    mdl_any: Any = AutoModelForSeq2SeqLM.from_pretrained(model_id_or_dir)
+    mdl = cast(HFSeq2SeqLike, mdl_any.to(device))
+    return tok, mdl
 
 
 def parse_args() -> TrainConfig:
@@ -185,36 +83,17 @@ def parse_args() -> TrainConfig:
     p.add_argument("--task", type=str, default="squad", choices=["squad", "cnndm", "sst2"])  # 形式のみ
     p.add_argument("--dataset_size", type=str, default="small", choices=["small", "full"])
     p.add_argument("--model_size", type=str, default="small", choices=list(MODEL_SIZES.keys()))
-    p.add_argument("--num_experts", type=int, default=16)
-    p.add_argument("--top_k", type=int, default=2)
-    p.add_argument("--router_dropout", type=float, default=0.1)
-    p.add_argument("--load_balance_coef", type=float, default=0.01)
     p.add_argument("--seq_len", type=int, default=512)
     p.add_argument("--train_epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--micro_batch", type=int, default=2)
     p.add_argument("--accum_steps", type=int, default=8)
-    p.add_argument("--boids_on", type=lambda x: x.lower() == "true", default=True)
-    p.add_argument("--boids_lambda_c", type=float, default=0.1)
-    p.add_argument("--boids_lambda_s", type=float, default=0.05)
-    p.add_argument("--boids_lambda_a", type=float, default=0.01)
-    p.add_argument("--boids_k_nn", type=int, default=8)
-    p.add_argument("--boids_sep_tau", type=float, default=1.5)
-    p.add_argument("--boids_warmup_frac", type=float, default=0.1)
     p.add_argument("--eval_trials", type=int, default=5)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--backend", type=str, default="tiny", choices=["tiny", "hf_moe"], help="Model backend: tiny (this repo) or hf_moe (stub)")
+    p.add_argument("--backend", type=str, default="hf_moe", choices=["hf_moe"], help="Model backend (HF Switch only)")
+    p.add_argument("--model_id", type=str, default="google/switch-base-16", help="HF model id or local dir")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--nan_guard", type=lambda x: x.lower() == "true", default=True, help="Guard against NaN/Inf loss and grads by skipping the step")
-    # Switch-Transformer style router/MoE options
-    p.add_argument("--switch_mode", type=lambda x: x.lower() == "true", default=False, help="Enable Switch-style top-1 routing with capacity and dropping")
-    p.add_argument("--capacity_factor_train", type=float, default=1.25)
-    p.add_argument("--capacity_factor_eval", type=float, default=1.0)
-    p.add_argument("--drop_tokens", type=lambda x: x.lower() == "true", default=True)
-    p.add_argument("--use_second_choice", type=lambda x: x.lower() == "true", default=False)
-    p.add_argument("--router_noise_std", type=float, default=0.0)
-    p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--fallback_self_ffn", type=lambda x: x.lower() == "true", default=True, help="Fallback dense FFN for overflow tokens (ignored when switch_mode=true)")
     # Data subsampling options
     p.add_argument("--train_fraction", type=float, default=1.0, help="Use this fraction of the training set (0-1]")
     p.add_argument("--eval_fraction", type=float, default=1.0, help="Use this fraction of the eval set (0-1]")
@@ -223,7 +102,9 @@ def parse_args() -> TrainConfig:
     # I/O options
     p.add_argument("--save_dir", type=str, default="", help="Directory to save final checkpoint (if non-empty)")
     p.add_argument("--eval_only", type=lambda x: x.lower() == "true", default=False, help="Load checkpoint and run evaluation only")
-    p.add_argument("--ckpt_path", type=str, default="", help="Path to a checkpoint .pt to load (required for --eval_only)")
+    p.add_argument("--ckpt_path", type=str, default="", help="Path to a HF directory to load (required for --eval_only)")
+    # Logging
+    p.add_argument("--log_every", type=int, default=0, help="Print a one-line progress log every N steps (0=disabled)")
     a = p.parse_args()
     return TrainConfig(**vars(a))
 
@@ -236,8 +117,15 @@ def main():
     getattr(torch, "manual_seed")(int(cfg.seed))
     if torch.cuda.is_available():
         getattr(torch.cuda, "manual_seed_all")(int(cfg.seed))
-    # Data & tokenizer (HF only)
-    tok: PreTrainedTokenizerBase
+    # HF model/tokenizer
+    if cfg.eval_only:
+        if not cfg.ckpt_path:
+            raise SystemExit("--eval_only requires --ckpt_path to be set to a HF directory")
+        tok, model = hf_load(cfg.ckpt_path, device)
+    else:
+        tok, model = hf_load(cfg.model_id, device)
+
+    # Data loaders (HF tokenizer id to align special tokens)
     from .data import hf_loader as _hf_loader
     train_loader, dev_loader, tok = _hf_loader.build_hf_dataloaders(
         cfg.task,
@@ -249,90 +137,17 @@ def main():
         cfg.eval_fraction,
         cfg.max_train_samples,
         cfg.max_eval_samples,
+        model_id=cfg.model_id,
     )
-
-    if cfg.backend == "tiny":
-        vocab_sz: Optional[int] = None
-        _gv = getattr(tok, "get_vocab", None)
-        if callable(_gv):
-            try:
-                v = cast(Dict[str, int], _gv())
-                vocab_sz = int(len(v))
-            except Exception:
-                vocab_sz = None
-        model = make_model(cfg, vocab_size=vocab_sz).to(device)
-    else:
-        # HF backend: 学習未対応。google/switch-base-16 を読み込み、Seq2Seqの簡易生成デモのみ実施して終了。
-        class _HFTokenizer(Protocol):
-            def __call__(self, text: str, *, return_tensors: str, add_special_tokens: bool = ...) -> Mapping[str, torch.Tensor]: ...
-            def decode(self, token_ids: List[int] | torch.Tensor, *, skip_special_tokens: bool = ...) -> str: ...
-            eos_token_id: Optional[int]
-
-        class _HFSeq2Seq(Protocol):
-            def generate(self, input_ids: torch.Tensor, **kwargs: object) -> torch.Tensor: ...
-            def to(self, device: torch.device | str) -> "_HFSeq2Seq": ...
-            def eval(self) -> "_HFSeq2Seq": ...
-
-        model_name = "google/switch-base-16"
-        tok_mod = importlib.import_module("transformers.models.auto.tokenization_auto")
-        AutoTokenizer = getattr(tok_mod, "AutoTokenizer")
-        tkn = cast(_HFTokenizer, AutoTokenizer.from_pretrained(model_name))
-        mdl_mod = importlib.import_module("transformers.models.auto.modeling_auto")
-        AutoModelForSeq2SeqLM = getattr(mdl_mod, "AutoModelForSeq2SeqLM")
-        mdl = cast(_HFSeq2Seq, AutoModelForSeq2SeqLM.from_pretrained(model_name)).to(device)
-        mdl = mdl.eval()
-
-        prompt = "summarize: Hugging Face is a platform for ML models and datasets."
-        with torch.no_grad():
-            enc = tkn(prompt, return_tensors="pt", add_special_tokens=True)
-            input_ids = enc["input_ids"].to(device)
-            gen = mdl.generate(input_ids, max_new_tokens=64, do_sample=False)
-            text = tkn.decode(gen[0], skip_special_tokens=True)
-        print("[hf_moe] sample:", text)
-        raise SystemExit("hf_moe backend is inference-only for now. Use --backend tiny to train.")
 
     # 評価専用モード: 先にチェックポイントをロード
-    if cfg.eval_only:
-        if not cfg.ckpt_path:
-            raise SystemExit("--eval_only requires --ckpt_path to be set")
-        ckpt = load_checkpoint(cfg.ckpt_path, device)
-        mcfg_opt = ckpt.get("model_cfg")
-        if mcfg_opt is not None:
-            # 型安全に再構築してロード
-            model = TinyMoETransformer(rebuild_moe_config(mcfg_opt)).to(device)
-        state = ckpt.get("model_state_dict")
-        if isinstance(state, Mapping):
-            state_t = cast(Mapping[str, torch.Tensor], state)
-            model.load_state_dict(state_t)
-        model.eval()
-        # 直後に評価セクションへジャンプ
-        goto_eval = True
-    else:
-        goto_eval = False
+    goto_eval = bool(cfg.eval_only)
 
     opt = AdamW(model.parameters(), lr=cfg.lr) if not goto_eval else AdamW(model.parameters(), lr=cfg.lr)
-    ce = nn.CrossEntropyLoss(ignore_index=-100)
-    # Boids (router level)
-    boids_router = BoidsRouterLoss(
-        lambda_coh=cfg.boids_lambda_c,
-        lambda_sep=cfg.boids_lambda_s,
-        lambda_ali=cfg.boids_lambda_a,
-        k_nn=cfg.boids_k_nn,
-        sep_tau=cfg.boids_sep_tau,
-    ) if cfg.boids_on else None
-    boids_cfg: BoidsConfig = BoidsConfig(
-        lambda_c=cfg.boids_lambda_c,
-        lambda_s=cfg.boids_lambda_s,
-        lambda_a=cfg.boids_lambda_a,
-        k_nn=cfg.boids_k_nn,
-        sep_tau=cfg.boids_sep_tau,
-        warmup_frac=cfg.boids_warmup_frac,
-    )
-    boids = BoidsRegularizer(boids_cfg) if cfg.boids_on else None
-
+    # Loss is returned by HF model when passing labels
     model.train()
     global_step = 0
-    total_steps = cfg.train_epochs * len(train_loader)
+    # total_steps not used explicitly
     scaler = AmpGradScaler(enabled=torch.cuda.is_available())
 
     if not goto_eval:
@@ -342,47 +157,14 @@ def main():
             for it, batch in enumerate(pbar):
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
+                pad_id_any: Any = getattr(tok, "pad_token_id", None)
+                pad_id = int(pad_id_any) if pad_id_any is not None else -100
+                attn_mask = (input_ids != pad_id).to(dtype=torch.long)
                 # Mixed precision forward
                 amp_ctx = amp_autocast(device_type="cuda", enabled=torch.cuda.is_available()) if torch.cuda.is_available() else nullcontext()
                 with amp_ctx:
-                    out = model(input_ids, return_hidden=True)
-                    logits, util, hidden, moe_stats = cast(
-                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]],
-                        out,
-                    )
-                    # LM CE (shifted)
-                    bsz, tsz, vsz = logits.shape
-                    loss_ce = ce(logits.view(bsz * tsz, vsz), labels.view(bsz * tsz))
-                    # Switch Aux LB: sum over MoE layers of (num_experts * (f_e * P_e).sum())
-                    loss_moe = torch.tensor(0.0, device=device)
-                    if len(moe_stats) > 0:
-                        for st in moe_stats:
-                            f = st["f"]  # fraction routed by primary choice
-                            P = st["P"]  # mean soft gate prob
-                            loss_moe = loss_moe + cfg.load_balance_coef * (model.cfg.num_experts * (f * P).sum())
-                    else:
-                        # Fallback proxy if no stats available
-                        loss_moe = cfg.load_balance_coef * (util * util).sum()
-                    loss_boids = torch.tensor(0.0, device=device)
-                    if boids is not None:
-                        boids.step(global_step, total_steps)
-                        # Use last hidden states as features (compact)
-                        loss_boids = boids(hidden)
-                    # Router-level Boids on gates if available (best-effort)
-                    loss_boids_router = torch.tensor(0.0, device=device)
-                    if boids_router is not None:
-                        # Router-level Boids on actual last MoE layer gates
-                        z = hidden.reshape(bsz * tsz, -1)
-                        if len(moe_stats) > 0:
-                            last = moe_stats[-1]
-                            gates_soft = last["gates_soft"]  # (N,E)
-                            topk_idx = last["topk_idx"]  # (N,K)
-                        else:
-                            gates_soft = torch.full((bsz * tsz, model.cfg.num_experts), 1.0 / model.cfg.num_experts, device=device)
-                            topk_idx = torch.zeros(bsz * tsz, model.cfg.top_k, dtype=torch.long, device=device)
-                        br = boids_router(z, gates_soft, topk_idx, model.cfg.num_experts)
-                        loss_boids_router = br["boids"]
-                    loss: torch.Tensor = loss_ce + loss_moe + loss_boids + loss_boids_router
+                    outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+                    loss: torch.Tensor = cast(torch.Tensor, outputs.loss)
 
                 # NaN/Inf guard on loss (pre-backward)
                 if cfg.nan_guard and not bool(torch.isfinite(loss)):
@@ -420,96 +202,76 @@ def main():
                     scaler.update()
                     opt.zero_grad(set_to_none=True)
                 global_step += 1
-                postfix: Dict[str, object] = {"loss": float(loss.item()), "boids": float(loss_boids.item()) if boids else 0.0}
+                postfix: Dict[str, object] = {"loss": float(loss.item())}
                 class _TqdmLike(Protocol):
                     def set_postfix(self, ordered_dict: Mapping[str, object] | None = ..., refresh: Optional[bool] = True, **kwargs: object) -> None: ...
                 cast(_TqdmLike, pbar).set_postfix(postfix)
+                # Optional plain-text progress for non-interactive consoles
+                if cfg.log_every > 0 and (it % cfg.log_every == 0):
+                    tot = len(train_loader)
+                    print(f"[train] epoch={epoch} step={it+1}/{tot} loss={float(loss.item()):.4f}")
 
     # 学習後にチェックポイント保存（任意）
     if (not goto_eval) and cfg.save_dir:
         try:
             os.makedirs(cfg.save_dir, exist_ok=True)
-            ckpt_path = os.path.join(cfg.save_dir, "checkpoint.pt")
-            mcfg_dict: ModelCfgDict = cast(ModelCfgDict, asdict(model.cfg))
-            payload: CkptPayload = {
-                "model_state_dict": cast(Mapping[str, torch.Tensor], model.state_dict()),
-                "model_cfg": mcfg_dict,
-                "train_cfg": asdict(cfg),
-            }
-            save_checkpoint(payload, ckpt_path)
-            print(f"[save] checkpoint: {ckpt_path}")
+            model.save_pretrained(cfg.save_dir)
+            getattr(tok, "save_pretrained")(cfg.save_dir)
+            print(f"[save] HF checkpoint dir: {cfg.save_dir}")
         except Exception as e:
             print(f"[save] failed: {e}")
 
-    # Quick eval: self-consistency via multiple stochastic passes (dropout active)
-    # Enable dropout for stochasticity during self-consistency measurement
-    model.train()
-    logits_runs: List[torch.Tensor] = []
-    util_eval: Optional[torch.Tensor] = None
-    last_batch: Optional[Dict[str, torch.Tensor]] = None
-    with torch.no_grad():
-        for _ in range(cfg.eval_trials):
-            for batch in dev_loader:
-                input_ids = batch["input_ids"].to(device)
-                logits, util_eval = model(input_ids)
-                logits_runs.append(logits.cpu())
-                last_batch = batch
-                break  # one batch per trial
-    sc = self_consistency_rate(logits_runs)
-    ent = expert_entropy(util_eval.detach().cpu()) if util_eval is not None else 0.0
-    # Compute n-gram repetition, and task metrics (EM/F1/ROUGE/Acc) on last dev batch
-    from .eval.metrics import squad_em_f1, rougeL_f1, sst2_label_from_text
-    last_logits: torch.Tensor = logits_runs[-1]
+    # Quick eval: generate on a small dev slice and compute task metrics
+    model.eval()
     rep2: float = 0.0
     rep3: float = 0.0
-    task_metric: Dict[str, float] = {}
-    if last_batch is not None:
-        labels_dev = last_batch["labels"]  # (B,T)
-        greedy = last_logits.argmax(dim=-1)  # (B,T)
-        pad_pred_ids: List[int] = [int(x) for x in greedy[0]]
-        rep2 = ngram_repeat_rate(pad_pred_ids, 2)
-        rep3 = ngram_repeat_rate(pad_pred_ids, 3)
-        # compute per-sample metrics on answer spans (labels != -100)
-        em_list: List[float] = []
-        f1_list: List[float] = []
-        rl_list: List[float] = []
-        acc_list: List[float] = []
-        for i in range(int(labels_dev.size(0))):
-            mask = labels_dev[i] != -100
-            if not bool(mask.any()):
-                continue
-            tgt_ids: List[int] = [int(x) for x in labels_dev[i][mask]]
-            prd_ids: List[int] = [int(x) for x in greedy[i][mask]]
-            # narrow tokenizer type for analyzers
-            class _TokDecodeLike(Protocol):
-                def decode(self, token_ids: List[int] | torch.Tensor, *, skip_special_tokens: bool = ...) -> str: ...
-            _tok = cast(_TokDecodeLike, tok)
-            tgt_txt = _tok.decode(tgt_ids, skip_special_tokens=True)
-            prd_txt = _tok.decode(prd_ids, skip_special_tokens=True)
-            if cfg.task == "squad":
-                em, f1 = squad_em_f1(prd_txt, tgt_txt)
-                em_list.append(em)
-                f1_list.append(f1)
-            elif cfg.task == "cnndm":
-                rl = rougeL_f1(prd_txt, tgt_txt)
-                rl_list.append(rl)
-            elif cfg.task == "sst2":
-                gt = sst2_label_from_text(tgt_txt)
-                pd = sst2_label_from_text(prd_txt)
-                if gt is not None and pd is not None:
-                    acc_list.append(1.0 if gt == pd else 0.0)
-        if cfg.task == "squad":
-            task_metric = {
-                "squad_em": float(sum(em_list) / max(1, len(em_list))),
-                "squad_f1": float(sum(f1_list) / max(1, len(f1_list))),
-            }
-        elif cfg.task == "cnndm":
-            task_metric = {"rougeL_f1": float(sum(rl_list) / max(1, len(rl_list)))}
-        elif cfg.task == "sst2":
-            task_metric = {"acc": float(sum(acc_list) / max(1, len(acc_list)))}
-    over = overuse_rate(util_eval.detach().cpu()) if util_eval is not None else 0.0
-    summary = {"self_consistency": sc, "expert_entropy": ent, "overuse_rate": over, "repeat_2gram": rep2, "repeat_3gram": rep3}
-    summary.update(task_metric)
+    em_list: List[float] = []
+    f1_list: List[float] = []
+    rl_list: List[float] = []
+    acc_list: List[float] = []
+    with torch.no_grad():
+        for _ in range(max(1, cfg.eval_trials)):
+            for batch in dev_loader:
+                input_ids = batch["input_ids"].to(device)
+                pad_id_any: Any = getattr(tok, "pad_token_id", None)
+                pad_id = int(pad_id_any) if pad_id_any is not None else -100
+                attn_mask = (input_ids != pad_id).to(dtype=torch.long)
+                gen = model.generate(input_ids=input_ids, attention_mask=attn_mask, max_new_tokens=64, do_sample=False)
+                # repetition metric on the first sample tokens
+                pad_pred_ids: List[int] = [int(x) for x in gen[0]]
+                rep2 = ngram_repeat_rate(pad_pred_ids, 2)
+                rep3 = ngram_repeat_rate(pad_pred_ids, 3)
+                # per-sample metrics using decoded strings
+                for i in range(int(input_ids.size(0))):
+                    # decode target
+                    lbl = batch["labels"][i]
+                    tgt_ids: List[int] = [int(x) for x in lbl[lbl != -100]]
+                    tgt_txt = getattr(tok, "decode")(tgt_ids, skip_special_tokens=True)
+                    prd_txt = getattr(tok, "decode")(gen[i], skip_special_tokens=True)
+                    if cfg.task == "squad":
+                        em, f1 = squad_em_f1(prd_txt, tgt_txt)
+                        em_list.append(em); f1_list.append(f1)
+                    elif cfg.task == "cnndm":
+                        rl = rougeL_f1(prd_txt, tgt_txt)
+                        rl_list.append(rl)
+                    elif cfg.task == "sst2":
+                        gt = sst2_label_from_text(tgt_txt)
+                        pd = sst2_label_from_text(prd_txt)
+                        if gt is not None and pd is not None:
+                            acc_list.append(1.0 if gt == pd else 0.0)
+                break  # one batch is enough per trial
+            break
+
+    summary: Dict[str, float] = {"repeat_2gram": rep2, "repeat_3gram": rep3}
+    if cfg.task == "squad":
+        summary.update({
+            "squad_em": float(sum(em_list) / max(1, len(em_list))),
+            "squad_f1": float(sum(f1_list) / max(1, len(f1_list))),
+        })
+    elif cfg.task == "cnndm":
+        summary.update({"rougeL_f1": float(sum(rl_list) / max(1, len(rl_list)))})
+    elif cfg.task == "sst2":
+        summary.update({"acc": float(sum(acc_list) / max(1, len(acc_list)))})
     print(summary)
 
 

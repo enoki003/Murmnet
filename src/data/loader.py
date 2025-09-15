@@ -19,7 +19,7 @@ def build_dataloaders(
 
     # dataset_size は "small" または "full" を想定
     if dataset_size not in {"small", "full"}:
-        # 後方互換のため 'dummy' やその他は 'small' にフォールバック
+        # 不正値は "small" にフォールバック
         dataset_size = "small"
 
     return build_hf_dataloaders(task, dataset_size, seq_len, micro_batch, num_workers=num_workers)

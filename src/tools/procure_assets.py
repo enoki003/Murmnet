@@ -4,7 +4,6 @@ Procure external models and datasets into local Hugging Face cache.
 - Datasets: SQuAD, CNN/DailyMail, SST-2
 
 Notes:
-- This repository's training backend for external MoE (hf_moe) is a stub. We cache artifacts to prepare future integration.
 - Respect dataset/model licenses when using the artifacts beyond local testing.
 """
 from __future__ import annotations
@@ -14,7 +13,8 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, TypedDict, Sized, cast, Protocol
 
 # datasets may be missing at type-check time in some environments
-from ..tools.hf_compat import load_dataset_compat, auto_tokenizer_from_pretrained, auto_config_from_pretrained
+import importlib
+from typing import Any
 
 # Prefer public transformers imports; fall back to internal paths for strict type checkers
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -42,7 +42,9 @@ class ModelArtifacts(TypedDict):
 
 
 def ensure_tokenizer(model_id: str) -> TokenizerReport:
-    tok: PreTrainedTokenizerBase = auto_tokenizer_from_pretrained(model_id)
+    tok_mod = importlib.import_module("transformers.models.auto.tokenization_auto")
+    AutoTokenizer = getattr(tok_mod, "AutoTokenizer")
+    tok: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_id)
     tdec = cast(_TokenizerDecodeLike, tok)
     # touch decode to force tokenizer.json download if needed
     eid = cast(Optional[int], getattr(tok, "eos_token_id", None))
@@ -54,7 +56,9 @@ def ensure_tokenizer(model_id: str) -> TokenizerReport:
 
 
 def ensure_config(model_id: str) -> ConfigReport:
-    _ = auto_config_from_pretrained(model_id)
+    cfg_mod = importlib.import_module("transformers.models.auto.configuration_auto")
+    AutoConfig = getattr(cfg_mod, "AutoConfig")
+    _cfg: Any = AutoConfig.from_pretrained(model_id)
     return {"model_id": model_id, "files": ["config.json"]}
 
 
@@ -77,13 +81,15 @@ class DatasetSplits(TypedDict):
 def procure_datasets() -> Dict[str, DatasetSplits]:
     report: Dict[str, DatasetSplits] = {}
     # SQuAD 1.1
-    ds_squad = cast(Mapping[str, Sized], load_dataset_compat("squad"))
+    ds_mod = importlib.import_module("datasets")
+    load_dataset = getattr(ds_mod, "load_dataset")
+    ds_squad = cast(Mapping[str, Sized], load_dataset("squad"))
     report["squad"] = {"splits": {k: int(len(v)) for k, v in ds_squad.items()}, "builder": "squad"}
     # CNN/DailyMail 3.0.0
-    ds_cnn = cast(Mapping[str, Sized], load_dataset_compat("cnn_dailymail", "3.0.0"))
+    ds_cnn = cast(Mapping[str, Sized], load_dataset("cnn_dailymail", "3.0.0"))
     report["cnn_dailymail"] = {"splits": {k: int(len(v)) for k, v in ds_cnn.items()}, "builder": "cnn_dailymail/3.0.0"}
     # GLUE SST-2
-    ds_sst2 = cast(Mapping[str, Sized], load_dataset_compat("glue", "sst2"))
+    ds_sst2 = cast(Mapping[str, Sized], load_dataset("glue", "sst2"))
     report["sst2"] = {"splits": {k: int(len(v)) for k, v in ds_sst2.items()}, "builder": "glue/sst2"}
     return report
 

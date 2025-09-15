@@ -1,77 +1,49 @@
-import os
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional, Mapping, Protocol, cast
+from typing import List, Tuple, Dict, Optional, Protocol, cast, Any, Mapping
 import importlib
 
 import torch
-import torch.nn.functional as F
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from ..tools.hf_compat import auto_tokenizer_from_pretrained
-
-from ..models.moe import MoEConfig, TinyMoETransformer
 
 
 @dataclass
 class ChatConfig:
-    model_size: str = "small"      # tiny/small/base (see src/train.py MODEL_SIZES)
-    num_experts: int = 8
-    top_k: int = 1
-    router_dropout: float = 0.1
-    load_balance_coef: float = 0.0  # not used at inference
+    model_id: str = "google/switch-base-16"
     seq_len: int = 256
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     temperature: float = 0.9
     max_new_tokens: int = 64
 
-
-def build_model(cfg: ChatConfig, vocab_size: Optional[int] = None) -> TinyMoETransformer:
-    # Minimal size mapping matching train.py
-    sizes = {
-        "tiny": dict(hidden_dim=384, ffn_dim=1536, num_layers=4),
-        "small": dict(hidden_dim=768, ffn_dim=3072, num_layers=6),
-        "base": dict(hidden_dim=1024, ffn_dim=4096, num_layers=8),
-    }
-    base = sizes[cfg.model_size]
-    mcfg = MoEConfig(
-        model_size=cfg.model_size,
-        hidden_dim=base["hidden_dim"],
-        ffn_dim=base["ffn_dim"],
-        num_layers=base["num_layers"],
-        num_experts=cfg.num_experts,
-        top_k=cfg.top_k,
-        router_dropout=cfg.router_dropout,
-        load_balance_coef=cfg.load_balance_coef,
-        vocab_size=vocab_size or 32000,
-        temperature=1.0,
-    )
-    return TinyMoETransformer(mcfg)
+def build_hf(model_id: str, device: torch.device) -> Tuple[PreTrainedTokenizerBase, Any]:
+    tok_mod = importlib.import_module("transformers.models.auto.tokenization_auto")
+    AutoTokenizer = getattr(tok_mod, "AutoTokenizer")
+    tok: Any = AutoTokenizer.from_pretrained(model_id)
+    if getattr(tok, "pad_token", None) is None:
+        pad_tok = getattr(tok, "eos_token", None) or getattr(tok, "unk_token", None) or getattr(tok, "sep_token", None)
+        if pad_tok is not None:
+            setattr(tok, "pad_token", pad_tok)
+    mdl_mod = importlib.import_module("transformers.models.auto.modeling_auto")
+    AutoModelForSeq2SeqLM = getattr(mdl_mod, "AutoModelForSeq2SeqLM")
+    mdl_any: Any = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+    mdl = mdl_any.to(device)
+    return cast(PreTrainedTokenizerBase, tok), mdl
 
 
 class _TokenizerDecodeLike(Protocol):
     def decode(self, token_ids: "torch.Tensor | List[int] | int", *, skip_special_tokens: bool = ...) -> str: ...
 
 
-def generate(model: TinyMoETransformer, tok: PreTrainedTokenizerBase, prompt: str, cfg: ChatConfig) -> str:
+def generate(model: Any, tok: PreTrainedTokenizerBase, prompt: str, cfg: ChatConfig) -> str:
     device = torch.device(cfg.device)
     model.eval()
     with torch.no_grad():
-        enc = cast(Mapping[str, torch.Tensor], tok(prompt, return_tensors="pt", add_special_tokens=False))
-        input_ids = enc["input_ids"].to(device)
-        # truncate last seq_len tokens to fit context
+        enc_any = tok(prompt, return_tensors="pt", add_special_tokens=True)
+        enc = cast(Mapping[str, Any], enc_any)
+        input_ids = cast(torch.Tensor, enc["input_ids"]).to(device)
         input_ids = input_ids[:, -cfg.seq_len:]
-        for _ in range(cfg.max_new_tokens):
-            logits, _ = model(input_ids)
-            next_logits = logits[:, -1, :] / max(1e-6, cfg.temperature)
-            probs = F.softmax(next_logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_id], dim=1)
-            eos_id = cast(Optional[int], getattr(tok, 'eos_token_id', None))
-            if eos_id is not None and next_id.item() == eos_id:
-                break
-    row_t = input_ids[0].to(dtype=torch.long)
-    tok_dec = cast(_TokenizerDecodeLike, tok)
-    out: str = tok_dec.decode(row_t, skip_special_tokens=True)
-    return out[len(prompt):]
+    gen = model.generate(input_ids=input_ids, max_new_tokens=cfg.max_new_tokens, do_sample=False)
+    out = cast(_TokenizerDecodeLike, tok).decode(gen[0], skip_special_tokens=True)
+    return out
 
 
 # --------- Gradio UI ---------
@@ -84,21 +56,12 @@ class _BlocksLike(Protocol):
 
 def build_demo():
     cfg = ChatConfig()
-    tok_name = os.environ.get("MURMNET_TOKENIZER", "gpt2")
-    tok: PreTrainedTokenizerBase = auto_tokenizer_from_pretrained(tok_name)
-    if getattr(tok, "pad_token", None) is None:
-        # Prefer EOS/UNK/SEP as padding if available
-        pad_tok = getattr(tok, "eos_token", None) or getattr(tok, "unk_token", None) or getattr(tok, "sep_token", None)
-        if pad_tok is not None:
-            setattr(tok, "pad_token", pad_tok)
-    vocab_size = int(getattr(tok, "vocab_size", 32000))
-    model = build_model(cfg, vocab_size=vocab_size)
-    model.to(cfg.device)
+    tok, model = build_hf(cfg.model_id, torch.device(cfg.device))
 
     gr = importlib.import_module("gradio")
 
-    with gr.Blocks(title="MurmNet TinyMoE Chat") as demo:
-        gr.Markdown("# MurmNet TinyMoE Chat\n小型MoEトランスフォーマでローカル会話")
+    with gr.Blocks(title="Switch Transformer Chat") as demo:
+        gr.Markdown("# Switch Transformer Chat\nHF google/switch-base-16 でローカル会話")
         chatbot = gr.Chatbot(type="messages", height=400)
         with gr.Row():
             msg = gr.Textbox(label="メッセージ", scale=4)
@@ -117,7 +80,7 @@ def build_demo():
         ) -> Tuple[List[Dict[str, str]], Dict[str, object]]:
             st_cfg = cast(ChatConfig, st["cfg"])  # runtime state typing
             st_tok = cast(PreTrainedTokenizerBase, st["tok"])  # tokenizer
-            st_model = cast(TinyMoETransformer, st["model"])  # model
+            st_model = st["model"]  # HF model
             # apply runtime knobs
             st_cfg.temperature = float(temperature)
             st_cfg.max_new_tokens = int(max_new)
@@ -131,7 +94,7 @@ def build_demo():
                 elif role == "assistant":
                     lines.append(f"Assistant: {content}")
             lines.append(f"User: {user_message}")
-            lines.append("Assistant: ")
+            lines.append("Assistant:")
             prompt = "\n".join(lines)
             out = generate(st_model, st_tok, prompt, st_cfg)
             new_history = (chat_history or []) + [
