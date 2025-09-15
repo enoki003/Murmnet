@@ -1,4 +1,5 @@
-from typing import Dict, List, Tuple, Optional, Mapping, Sequence, TypeAlias, Protocol, runtime_checkable, cast, Callable, Iterable
+from typing import Dict, List, Tuple, Optional, Mapping, Sequence, TypeAlias, Protocol, runtime_checkable, cast, Callable, Iterable, Any
+import os
 
 import torch
 from torch import Tensor
@@ -18,7 +19,14 @@ class _SupportsHF(Protocol):
 class HFDatasetLike(Protocol):
     def __len__(self) -> int: ...
     def __getitem__(self, idx: int) -> Mapping[str, object]: ...
-    def map(self, function: Callable[[Mapping[str, object]], Mapping[str, object]] | Callable[[Mapping[str, object]], Mapping[str, Sequence[int]]], *, remove_columns: Sequence[str] | None = None) -> "HFDatasetLike": ...
+    def map(
+        self,
+        function: Callable[[Mapping[str, object]], Mapping[str, object]]
+        | Callable[[Mapping[str, object]], Mapping[str, Sequence[int]]],
+        *,
+        remove_columns: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> "HFDatasetLike": ...
     def select(self, indices: Iterable[int]) -> "HFDatasetLike": ...
 
 
@@ -31,6 +39,16 @@ class HFDatasetDictLike(Protocol):
 
 def _load_dataset_compat(builder: str, subset: Optional[str] = None) -> HFDatasetDictLike:
     datasets_mod = importlib.import_module("datasets")
+    # Windows 環境では HF datasets のキャッシュ周りでファイル移動が失敗することがあるため、
+    # map 時のキャッシュ書き込みを抑止する目的でグローバルにキャッシュ無効化（Windows のみ）
+    try:
+        if os.name == "nt":
+            disable_caching = getattr(datasets_mod, "disable_caching", None)
+            if callable(disable_caching):
+                disable_caching()
+    except Exception:
+        # ベストエフォート（失敗しても致命的ではない）
+        pass
     load_dataset_func: Callable[..., object] = getattr(datasets_mod, "load_dataset")
     ds_obj = load_dataset_func(builder, subset) if subset is not None else load_dataset_func(builder)
     return cast(HFDatasetDictLike, ds_obj)
@@ -94,6 +112,15 @@ def build_hf_dataloaders(
 
     if task == "squad":
         ds = _load_dataset_compat("squad")
+        # Prepare sources (preselect small before map to avoid tokenizing whole split)
+        train_src = cast(HFDatasetLike, ds["train"])  # type: ignore[index]
+        dev_src = cast(HFDatasetLike, ds["validation"])  # type: ignore[index]
+        if dataset_size == "small":
+            try:
+                train_src = train_src.select(range(min(5000, len(train_src))))
+                dev_src = dev_src.select(range(min(1000, len(dev_src))))
+            except Exception:
+                pass
         def encode(ex: Mapping[str, object]) -> Dict[str, List[int]]:
             q: str = str(ex["question"])  # hf schema
             c: str = str(ex["context"])   # hf schema
@@ -115,10 +142,38 @@ def build_hf_dataloaders(
             if len(labels) == 0:
                 labels = [eos_id]
             return {"input_ids": input_ids, "labels": labels}
-        train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
-        dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
+        train = cast(
+            _SupportsHF,
+            train_src.map(
+                encode,
+                remove_columns=[],
+                load_from_cache_file=False,
+                keep_in_memory=True,
+                num_proc=1,
+                desc="tokenize-squad-train",
+            ),
+        )
+        dev = cast(
+            _SupportsHF,
+            dev_src.map(
+                encode,
+                remove_columns=[],
+                load_from_cache_file=False,
+                keep_in_memory=True,
+                num_proc=1,
+                desc="tokenize-squad-dev",
+            ),
+        )
     elif task == "cnndm":
         ds = _load_dataset_compat("cnn_dailymail", "3.0.0")
+        train_src = cast(HFDatasetLike, ds["train"])  # type: ignore[index]
+        dev_src = cast(HFDatasetLike, ds["validation"])  # type: ignore[index]
+        if dataset_size == "small":
+            try:
+                train_src = train_src.select(range(min(5000, len(train_src))))
+                dev_src = dev_src.select(range(min(1000, len(dev_src))))
+            except Exception:
+                pass
         def encode(ex: Mapping[str, object]) -> Dict[str, List[int]]:
             art: str = str(ex["article"])     # hf schema
             summ: str = str(ex["highlights"])  # hf schema
@@ -131,10 +186,38 @@ def build_hf_dataloaders(
             if len(labels) == 0:
                 labels = [eos_id]
             return {"input_ids": input_ids, "labels": labels}
-        train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
-        dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
+        train = cast(
+            _SupportsHF,
+            train_src.map(
+                encode,
+                remove_columns=[],
+                load_from_cache_file=False,
+                keep_in_memory=True,
+                num_proc=1,
+                desc="tokenize-cnndm-train",
+            ),
+        )
+        dev = cast(
+            _SupportsHF,
+            dev_src.map(
+                encode,
+                remove_columns=[],
+                load_from_cache_file=False,
+                keep_in_memory=True,
+                num_proc=1,
+                desc="tokenize-cnndm-dev",
+            ),
+        )
     elif task == "sst2":
         ds = _load_dataset_compat("glue", "sst2")
+        train_src = cast(HFDatasetLike, ds["train"])  # type: ignore[index]
+        dev_src = cast(HFDatasetLike, ds["validation"])  # type: ignore[index]
+        if dataset_size == "small":
+            try:
+                train_src = train_src.select(range(min(5000, len(train_src))))
+                dev_src = dev_src.select(range(min(1000, len(dev_src))))
+            except Exception:
+                pass
         def encode(ex: Mapping[str, object]) -> Dict[str, List[int]]:
             text: str = str(ex["sentence"])  # hf schema
             label_val = ex.get("label")
@@ -148,8 +231,28 @@ def build_hf_dataloaders(
             if len(labels) == 0:
                 labels = [eos_id]
             return {"input_ids": input_ids, "labels": labels}
-        train = cast(_SupportsHF, ds["train"].map(encode, remove_columns=[]))
-        dev = cast(_SupportsHF, ds["validation"].map(encode, remove_columns=[]))
+        train = cast(
+            _SupportsHF,
+            train_src.map(
+                encode,
+                remove_columns=[],
+                load_from_cache_file=False,
+                keep_in_memory=True,
+                num_proc=1,
+                desc="tokenize-sst2-train",
+            ),
+        )
+        dev = cast(
+            _SupportsHF,
+            dev_src.map(
+                encode,
+                remove_columns=[],
+                load_from_cache_file=False,
+                keep_in_memory=True,
+                num_proc=1,
+                desc="tokenize-sst2-dev",
+            ),
+        )
     else:
         raise ValueError("HF loader supports only 'squad', 'cnndm', and 'sst2' in this minimal setup")
 
