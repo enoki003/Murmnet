@@ -33,3 +33,9 @@ dist/
 
 # Data (optional)
 /data/
+
+# Training artifacts and large files
+runs/
+*.pt
+*.bin
+*.safetensors

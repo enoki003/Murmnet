@@ -44,6 +44,12 @@ class TrainConfig:
     ckpt_path: str
     # Logging
     log_every: int
+    # Boids regularization
+    boids_on: bool
+    boids_weight: float
+    boids_align: float
+    boids_sep: float
+    boids_entropy: float
 
 
 MODEL_SIZES: Dict[str, Dict[str, int]] = {
@@ -55,11 +61,11 @@ MODEL_SIZES: Dict[str, Dict[str, int]] = {
 
 # HF save/load helpers
 class HFSeq2SeqLike(Protocol):
-    def __call__(self, *, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = ..., labels: Optional[torch.Tensor] = ...) -> Any: ...
+    def __call__(self, *, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = ..., labels: Optional[torch.Tensor] = ..., **kwargs: Any) -> Any: ...
     def parameters(self) -> Any: ...
     def train(self, mode: bool = ...) -> Any: ...
     def eval(self) -> Any: ...
-    def generate(self, *, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = ..., max_new_tokens: Optional[int] = ..., do_sample: Optional[bool] = ...) -> torch.Tensor: ...
+    def generate(self, *, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = ..., max_new_tokens: Optional[int] = ..., do_sample: Optional[bool] = ..., **kwargs: Any) -> torch.Tensor: ...
     def save_pretrained(self, save_directory: str) -> Any: ...
 
 
@@ -105,6 +111,12 @@ def parse_args() -> TrainConfig:
     p.add_argument("--ckpt_path", type=str, default="", help="Path to a HF directory to load (required for --eval_only)")
     # Logging
     p.add_argument("--log_every", type=int, default=0, help="Print a one-line progress log every N steps (0=disabled)")
+    # Boids regularization options
+    p.add_argument("--boids_on", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--boids_weight", type=float, default=0.01)
+    p.add_argument("--boids_align", type=float, default=1.0)
+    p.add_argument("--boids_sep", type=float, default=1.0)
+    p.add_argument("--boids_entropy", type=float, default=0.0)
     a = p.parse_args()
     return TrainConfig(**vars(a))
 
@@ -163,8 +175,37 @@ def main():
                 # Mixed precision forward
                 amp_ctx = amp_autocast(device_type="cuda", enabled=torch.cuda.is_available()) if torch.cuda.is_available() else nullcontext()
                 with amp_ctx:
-                    outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
-                    loss: torch.Tensor = cast(torch.Tensor, outputs.loss)
+                    # Ensure router logits are returned if available (HF Switch supports this flag)
+                    outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels, output_router_logits=cfg.boids_on)
+                    outputs_any: Any = outputs
+                    loss: torch.Tensor = cast(torch.Tensor, outputs_any.loss)
+                    if cfg.boids_on:
+                        # Collect router probs per layer if present
+                        router_probs: list[torch.Tensor] = []
+                        rls = getattr(outputs_any, "router_logits", None)
+                        if rls is not None:
+                            # router_logits may be a list[Tensor] with shape (B, T, E)
+                            if isinstance(rls, (list, tuple)):
+                                for r in cast(list[Any], rls):
+                                    if isinstance(r, torch.Tensor):
+                                        router_probs.append(torch.softmax(r, dim=-1))
+                            elif isinstance(rls, torch.Tensor):
+                                router_probs.append(torch.softmax(rls, dim=-1))
+                        if router_probs:
+                            try:
+                                from .regularizers.boids import boids_regularize
+                                reg, _ = boids_regularize(
+                                    router_probs,
+                                    attn_mask,
+                                    weight=cfg.boids_weight,
+                                    w_align=cfg.boids_align,
+                                    w_separation=cfg.boids_sep,
+                                    w_entropy=cfg.boids_entropy,
+                                )
+                                loss = loss + reg
+                            except Exception as _:
+                                # If anything goes wrong, skip regularization silently
+                                pass
 
                 # NaN/Inf guard on loss (pre-backward)
                 if cfg.nan_guard and not bool(torch.isfinite(loss)):
