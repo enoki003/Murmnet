@@ -1,4 +1,4 @@
-# MurmNet（Plan‑B: HF Switch + Boids 正則化）
+# MurmNe
 
 このリポジトリは Hugging Face Transformers の Google Switch‑Transformer（例: `google/switch-base-16`）を用いた学習・評価・チャットを提供します。
 Plan‑B として、Switch のルーティング確率に対して Boids 風正則化（整列・分散・任意のエントロピー）を必須で適用します。
